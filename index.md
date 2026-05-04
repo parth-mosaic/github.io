@@ -5,7 +5,7 @@
 > **Database:** PostgreSQL (via SQLAlchemy / Flask-SQLAlchemy)
 > **Source Schema:** `bravo_benefits_standardized.md` (April 28, 2026) — post-architecture-review refactor
 > **Standard Applied:** Flask Boilerplate `DB_SCHEMA.md` architectural conventions
-> **Scope:** Domain 1 — Core Identity & Auth · Domain 2 — Benefits & TRS
+> **Scope:** Domain 1 — Core Identity & Auth · Domain 2 — Benefits & TRS · Domain 3 — Reward & Recognition
 
 ---
 
@@ -42,6 +42,16 @@
    - [trs_components](#trs_components)
    - [trs_employee_data](#trs_employee_data)
    - [trs_statements](#trs_statements)
+   
+   **Domain 3 — Reward & Recognition**
+   - [rnr_config](#rnr_config)
+   - [rnr_teams](#rnr_teams)
+   - [rnr_user_teams](#rnr_user_teams)
+   - [rnr_values](#rnr_values)
+   - [rnr_nominations](#rnr_nominations)
+   - [rnr_rewards](#rnr_rewards)
+   - [rnr_budget_individual](#rnr_budget_individual)
+   - [rnr_budget_team](#rnr_budget_team)
 
 6. [Deleted Tables — Migration Notes](#deleted-tables--migration-notes)
 7. [Entity Relationship Summary](#entity-relationship-summary)
@@ -59,7 +69,6 @@ The **Bravo Benefits Platform** is a multi-tenant SaaS application providing emp
 | **Core Identity & Auth** | `groups`, `sectors`, `lead_sources`, `organisations`, `users`, `user_org_memberships`, `org_teams`, `user_org_teams`, `org_internal_notes`, `image` | Identity, authentication, org structure, branding, and SSO |
 | **Benefits & TRS** | `master_benefits`, `benefit_levels`, `org_benefits`, `org_benefit_team_levels`, `custom_tiles`, `benefit_requests`, `employee_benefit_status`, `trs_config`, `trs_component_types`, `trs_components`, `trs_employee_data`, `trs_statements` | Benefit catalogue, org offerings, and Total Reward Statements |
 
-> **Scope note:** Domain 3 (R&R), Domain 4 (Content & Marketing), Domain 5 (Platform Config), and Domain 6 (Analytics) are intentionally excluded from this document.
 
 ---
 
@@ -1153,6 +1162,438 @@ Captures the complete state of the TRS at generation time so that historical sta
 
 ---
 
+### Domain 3 — Reward & Recognition
+
+---
+
+### `rnr_config`
+
+**Business Purpose:** R&R module configuration for an organisation — one record per org when the R&R feature is enabled (controlled by `organisations.settings.features.is_rnr_enabled`). Defines budget mode, branding, behavioural flags, and the org's perk catalogue. The `predefined_perks` JSONB array replaces the deleted `rnr_perks` standalone table; the `rules_data` JSONB supplements (but does not replace) the flat control columns.
+
+**Base Class:** `Base`
+
+#### Columns
+
+| Name | Type | Constraints | Description |
+|---|---|---|---|
+| *(Base fields)* | — | — | `id`, `uuid`, `org_uuid`, `created_at`, `updated_at`, `deleted_at`, `created_by`, `updated_by`, `deleted_by` |
+| `rnr_title` | `String(200)` | NOT NULL, default=`Reward & Recognition` | Custom display name for the R&R module shown throughout the employee portal |
+| `wall_name` | `String(200)` | NOT NULL, default=`Wall of Fame` | Custom name for the Wall of Fame tab visible to employees |
+| `email_header_image_uuid` | `String` | FK → `image.uuid`, Nullable | UUID of the header image used in R&R email communications (`ON DELETE SET NULL`) |
+| `logo_url` | `Text` | Nullable | S3 URL of the R&R module logo shown at the top of the R&R section |
+| `color_main` | `String(7)` | Nullable | Primary R&R brand colour in hex format (e.g. `#FF5733`) |
+| `color_secondary` | `String(7)` | Nullable | Secondary R&R brand colour in hex format; used for accents within the R&R module |
+| `reward_pot_mode` | `String(10)` | Nullable, CHECK IN (`per_user`, `per_team`) | Budget allocation model — mutually exclusive; `per_user` assigns budgets to individual R&R admins; `per_team` pools budget at the R&R team level. Cannot mix within an org |
+| `is_active` | `Boolean` | NOT NULL, default=True | Whether the R&R module is currently active for this org; False suppresses all R&R routes for the org's users |
+| `predefined_perks` | `JSONB` | Nullable | The org's catalogue of redeemable predefined perks. Replaces the deleted `rnr_perks` table. See **`predefined_perks` JSONB Structure** below |
+| `rules_data` | `JSONB` | Nullable | Supplementary R&R behavioural rules. Supplements (does NOT replace) flat control columns — provides a grouped view for UI serialisation and future extensibility. See **`rules_data` JSONB Structure** below |
+
+> **SQLAlchemy `__table_args__` Note:** `reward_pot_mode` requires:
+> `CheckConstraint("reward_pot_mode IN ('per_user', 'per_team')", name='ck_rnr_config_reward_pot_mode')`
+
+#### `predefined_perks` JSONB Structure
+
+An array of predefined perk objects representing the org's available non-monetary reward catalogue. Replaces the deleted `rnr_perks` standalone table. When an employee is awarded a predefined perk, the name and emoji are captured as an immutable snapshot on `rnr_rewards.predefined_perk_name` / `predefined_perk_emoji` so that historical reward records remain accurate even if the org later edits or removes a perk from this catalogue.
+
+```json
+[
+  {
+    "name":      "Extra Day Off",
+    "emoji":     "🏖️",
+    "is_active": true
+  }
+]
+```
+
+| Key | Type | Description |
+|---|---|---|
+| `name` | `String` | Display name of the perk shown in the reward selection UI (e.g. `"Extra Day Off"`, `"Team Lunch"`). *Migrated from deleted `rnr_perks.perk_name`.* |
+| `emoji` | `String` | Optional emoji icon displayed alongside the perk name (e.g. `"🏖️"`). *Migrated from deleted `rnr_perks.perk_emoji`.* |
+| `is_active` | `Boolean` | When False, the perk is hidden from the reward selection UI but retained in the array so that existing historical snapshots on `rnr_rewards` remain unaffected. *Migrated from deleted `rnr_perks.is_active`.* |
+
+#### `rules_data` JSONB Structure
+
+Supplements the flat behavioural columns — does **not** replace them. The flat columns remain the authoritative source; `rules_data` provides a grouped representation for UI serialisation. When reading rules, always prefer the flat column over the JSONB key; the JSONB is kept in sync as a convenience projection.
+
+```json
+{
+  "approve_before_publish":    false,
+  "allow_money_rewards":       false,
+  "allow_perk_rewards":        false,
+  "acknowledge_birthdays":     false,
+  "acknowledge_long_service":  false
+}
+```
+
+| Key | Flat Column | Type | Default | Description |
+|---|---|---|---|---|
+| `approve_before_publish` | `approve_before_publish` *(flat)* | `Boolean` | `false` | When True, nominations require admin approval before appearing on the Wall of Fame. *Supplemented into JSONB for UI grouping.* |
+| `allow_money_rewards` | `allow_money_rewards` *(flat)* | `Boolean` | `false` | Whether monetary rewards can be given within this org. *Supplemented into JSONB for UI grouping.* |
+| `allow_perk_rewards` | `allow_perk_rewards` *(flat)* | `Boolean` | `false` | Whether predefined or custom perk rewards can be given. *Supplemented into JSONB for UI grouping.* |
+| `acknowledge_birthdays` | `acknowledge_birthdays` *(flat)* | `Boolean` | `false` | Drives the birthday scheduler sweep that auto-generates nominations for `user_org_memberships.date_of_birth` matches. *Supplemented into JSONB for UI grouping.* |
+| `acknowledge_long_service` | `acknowledge_long_service` *(flat)* | `Boolean` | `false` | Drives the long-service scheduler sweep based on `user_org_memberships.joining_date` anniversaries. *Supplemented into JSONB for UI grouping.* |
+
+> **Implementation Note:** The five keys in `rules_data` mirror the five flat Boolean columns that are retained on this table. When updating rules via the API, write to both the flat column and the JSONB key atomically in a single `UPDATE`. The flat columns are the indexed, query-authoritative values; `rules_data` is a convenience grouping for the frontend serialiser.
+
+#### Indexes & Constraints
+
+| Name | Columns | Type |
+|---|---|---|
+| `uq_rnr_config_org_uuid` | `org_uuid` | Unique — one R&R config per org |
+
+---
+
+### `rnr_teams`
+
+**Business Purpose:** R&R-specific teams within an organisation. **Entirely separate from `org_teams`** (benefit-access teams) — distinct memberships, budget ledgers, and admin roles. R&R teams exist solely to pool reward budgets and scope nomination visibility in the R&R module; they have no effect on benefit access or TRS calculations. Cannot be deleted if financial budget rows exist; use `is_active=False` to retire a team while preserving its ledger history.
+
+**Base Class:** `Base`
+
+#### Columns
+
+| Name | Type | Constraints | Description |
+|---|---|---|---|
+| *(Base fields)* | — | — | `id`, `uuid`, `org_uuid`, `created_at`, `updated_at`, `deleted_at`, `created_by`, `updated_by`, `deleted_by` |
+| `team_name` | `String(150)` | NOT NULL | R&R team display name shown in the admin UI and on the Wall of Fame filter |
+| `is_active` | `Boolean` | NOT NULL, default=True | Whether the team is active; set False instead of deleting if budget ledger rows (`rnr_budget_team`) exist to preserve financial history |
+
+#### Indexes & Constraints
+
+| Name | Columns | Type |
+|---|---|---|
+| `uq_rnr_teams_org_name` | `org_uuid`, `team_name` | Unique — team names must be unique within an org |
+| `idx_rnr_teams_org` | `org_uuid` | Index |
+
+---
+
+### `rnr_user_teams`
+
+**Business Purpose:** Maps a user's org membership to an R&R team. `can_give_money` and `can_give_perks` permission fields are set by Bravo staff only and control which reward types the R&R admin can award within this team context.
+
+**Base Class:** `Base`
+
+#### Columns
+
+| Name | Type | Constraints | Description |
+|---|---|---|---|
+| *(Base fields)* | — | — | `id`, `uuid`, `org_uuid`, `created_at`, `updated_at`, `deleted_at`, `created_by`, `updated_by`, `deleted_by` |
+| `membership_uuid` | `String` | FK → `user_org_memberships.uuid`, NOT NULL | The user's org membership being assigned to an R&R team |
+| `rnr_team_uuid` | `String` | FK → `rnr_teams.uuid`, NOT NULL | The R&R team the membership is being added to |
+| `is_rnr_admin` | `Boolean` | NOT NULL, default=False | Whether this user acts as an R&R admin (team leader) for this team — can nominate and give rewards on behalf of the team |
+| `can_give_money` | `Boolean` | NOT NULL, default=False | Whether this user can give monetary rewards within this team — **set by Bravo staff only** |
+| `can_give_perks` | `Boolean` | NOT NULL, default=False | Whether this user can give perk rewards within this team — **set by Bravo staff only** |
+| `email_opt_in` | `Boolean` | NOT NULL, default=True | Whether the user opts in to R&R notification emails for this team context |
+| `assigned_at` | `DateTime (tz)` | NOT NULL, default=now | Timestamp of when this membership was assigned to the team |
+
+#### Indexes & Constraints
+
+| Name | Columns | Type |
+|---|---|---|
+| `uq_rnr_user_teams_membership_team` | `membership_uuid`, `rnr_team_uuid` | Unique — prevents duplicate team assignments |
+| `idx_rnr_user_teams_team` | `rnr_team_uuid` | Index |
+
+---
+
+### `rnr_values`
+
+**Business Purpose:** Org-defined value cards — the nomination types available for selection when an employee submits a nomination. Retired cards are retained for historical nomination display; they cannot be selected for new nominations. Birthday and long-service auto-nominations reference dedicated system cards of the corresponding `card_type`.
+
+**Base Class:** `Base`
+
+#### Columns
+
+| Name | Type | Constraints | Description |
+|---|---|---|---|
+| *(Base fields)* | — | — | `id`, `uuid`, `org_uuid`, `created_at`, `updated_at`, `deleted_at`, `created_by`, `updated_by`, `deleted_by` |
+| `value_name` | `String(200)` | NOT NULL | Display name of the value / nomination type shown in the nomination selection UI |
+| `image_uuid` | `String` | FK → `image.uuid`, Nullable | Value card image UUID from the `image` table (`ON DELETE SET NULL`) |
+| `card_type` | `String(20)` | NOT NULL, default=`nomination`, CHECK IN (`nomination`, `birthday`, `long_service`, `rnr_admin`) | Type of card: `nomination` = standard employee-to-employee; `birthday` = auto-birthday card; `long_service` = auto-anniversary card; `rnr_admin` = admin-initiated |
+| `show_on_wall` | `Boolean` | NOT NULL, default=True | Whether nominations using this value card appear on the Wall of Fame |
+| `is_retired` | `Boolean` | NOT NULL, default=False | When True, the card is hidden from new nomination selection but retained for historical display |
+| `display_order` | `Integer` | NOT NULL, default=0 | Sort order in the nomination UI; lower = displayed first |
+
+> **SQLAlchemy `__table_args__` Note:** `card_type` requires:
+> `CheckConstraint("card_type IN ('nomination', 'birthday', 'long_service', 'rnr_admin')", name='ck_rnr_values_card_type')`
+
+---
+
+### `rnr_nominations`
+
+**Business Purpose:** Core nomination record — the anchor of every R&R event, including automated birthday and long-service recognitions. Bravo staff can correct typos on existing nominations. Cannot be hard-deleted or soft-deleted (`is_deleted=True`) if a linked `rnr_rewards` row exists — the reward is the financial ledger anchor.
+
+> **1:1 Relationship with `rnr_rewards`:** A nomination and its reward are in a strict one-to-one relationship. `rnr_rewards.nomination_uuid` carries a `UNIQUE` constraint — there can never be more than one reward per nomination. Automated rewards (birthday, long-service) still require the scheduler to generate a system nomination row first, which acts as the ledger anchor, before a reward row is created.
+
+> **Soft-Delete Guard:** A nomination with a linked `rnr_rewards` row must **never** have `is_deleted=True` set. The `ON DELETE RESTRICT` FK on the reward row blocks physical deletion at the DB layer; however, the `is_deleted` boolean bypasses that constraint and must be guarded at the service layer (see guard below).
+
+**Base Class:** `Base` + `SqlAlchemyEventMixin`
+
+#### Columns
+
+| Name | Type | Constraints | Description |
+|---|---|---|---|
+| *(Base fields)* | — | — | `id`, `uuid`, `org_uuid`, `created_at`, `updated_at`, `deleted_at`, `created_by`, `updated_by`, `deleted_by` |
+| `nominator_uuid` | `String` | FK → `user_org_memberships.uuid`, NOT NULL | Membership of the user making the nomination (or the system scheduler for automated nominations) |
+| `nominee_uuid` | `String` | FK → `user_org_memberships.uuid`, NOT NULL | Membership of the user being nominated |
+| `value_uuid` | `String` | FK → `rnr_values.uuid`, NOT NULL | The R&R value card selected for this nomination |
+| `title` | `String(255)` | NOT NULL | Nomination headline shown on the Wall of Fame |
+| `description` | `Text` | Nullable | Full nomination reason / story; shown on wall if `rnr_config.show_desc_on_wall = True` |
+| `status` | `String(15)` | NOT NULL, default=`pending`, CHECK IN (`pending`, `approved`, `rejected`, `auto_approved`) | Approval workflow status: `pending` = awaiting review (when `rnr_config.approve_before_publish = True`); `approved` / `rejected` = admin decision; `auto_approved` = instantly published without review |
+| `show_on_wall` | `Boolean` | NOT NULL, default=True | Whether this nomination is visible on the Wall of Fame |
+| `approved_by_uuid` | `String` | FK → `users.uuid`, Nullable | UUID of the user who approved or rejected the nomination |
+| `approved_at` | `DateTime (tz)` | Nullable | Timestamp of the approval or rejection decision |
+| `is_deleted` | `Boolean` | NOT NULL, default=False | Bravo-only soft-delete flag; service layer must block this if a linked `rnr_rewards` row exists (see Soft-Delete Guard below) |
+
+> **SQLAlchemy `__table_args__` Note:** `status` requires:
+> `CheckConstraint("status IN ('pending', 'approved', 'rejected', 'auto_approved')", name='ck_rnr_nominations_status')`
+
+#### Relationships
+
+| Name | Target | Type | Description | Cascade Behavior |
+|---|---|---|---|---|
+| `nominator` | `UserOrgMembership` | Many-to-One | The nominating employee or system | `ON DELETE RESTRICT` — membership cannot be deleted while nominations exist |
+| `nominee` | `UserOrgMembership` | Many-to-One | The nominated employee | `ON DELETE RESTRICT` — membership cannot be deleted while nominations exist |
+| `value` | `RnrValue` | Many-to-One | The R&R value card selected | `ON DELETE RESTRICT` — value card cannot be deleted while nominations reference it |
+| `reward` | `RnrReward` | One-to-One | The associated reward record (if any) | `ON DELETE RESTRICT` — **nomination cannot be deleted while a reward record exists** |
+
+#### Indexes & Constraints
+
+| Name | Columns | Type |
+|---|---|---|
+| `idx_rnr_nominations_org` | `org_uuid` | Index |
+| `idx_rnr_nominations_nominee` | `nominee_uuid` | Index |
+| `idx_rnr_wall` | `org_uuid`, `show_on_wall`, `status` WHERE `is_deleted = False` | Partial Index — used by Wall of Fame queries |
+
+#### Soft-Delete Guard
+
+> ⚠️ **Critical Business Rule:** A nomination that has an associated `rnr_rewards` row **must never be flagged `is_deleted=True`**. The reward relationship carries `ON DELETE RESTRICT` at the DB layer (blocks physical deletion), but the `is_deleted` soft flag bypasses that constraint — guard this at the **service layer**.
+
+```python
+from app.models.rnr_nominations import RnrNomination
+from app.models.rnr_rewards import RnrReward
+
+def soft_delete_nomination(nomination_uuid: str) -> None:
+    """
+    Soft-delete a nomination. Raises if a financial reward is linked —
+    a nomination with a reward is immutable (financial audit trail).
+    Only callable by Bravo staff.
+    """
+    nomination = RnrNomination.get_by_uuid(nomination_uuid)
+    if nomination is None:
+        raise ValueError(f"Nomination {nomination_uuid} not found.")
+
+    # Guard: block soft-delete if a reward record exists
+    linked_reward = RnrReward.get_by_nomination_uuid(nomination_uuid)
+    if linked_reward is not None:
+        raise PermissionError(
+            f"Nomination {nomination_uuid} cannot be deleted because a "
+            f"financial reward (uuid={linked_reward.uuid}) is linked to it. "
+            "Retract the reward first."
+        )
+
+    nomination.update_multiple_property_by_uuid(
+        nomination_uuid, {'is_deleted': True}
+    )
+```
+
+---
+
+### `rnr_rewards`
+
+**Business Purpose:** Monetary or perk reward linked to a nomination — strict **1:1** relationship enforced by the `UNIQUE` constraint on `nomination_uuid`. One reward per nomination, never many-to-one. Automated rewards (birthdays, long-service) still require the scheduler to generate a system nomination row first as the ledger anchor before this row is created.
+
+`predefined_perk_name` and `predefined_perk_emoji` capture an **immutable snapshot** of the perk at reward creation time. This means historical reward records remain accurate even if the org later edits or removes the perk from `rnr_config.predefined_perks` — the snapshot is self-contained and does not reference the live catalogue. `custom_perk_text` is retained for free-text ad-hoc perks that are not drawn from the predefined catalogue.
+
+**Base Class:** `Base`
+
+#### Columns
+
+| Name | Type | Constraints | Description |
+|---|---|---|---|
+| *(Base fields)* | — | — | `id`, `uuid`, `org_uuid`, `created_at`, `updated_at`, `deleted_at`, `created_by`, `updated_by`, `deleted_by` |
+| `nomination_uuid` | `String` | FK → `rnr_nominations.uuid`, **Unique**, NOT NULL | The associated nomination. **UNIQUE constraint enforces the strict 1:1 rule — one reward per nomination, never more.** |
+| `reward_type` | `String(10)` | NOT NULL, CHECK IN (`money`, `perk`) | Whether this is a monetary (`money`) or perk-based (`perk`) reward |
+| `amount` | `Numeric(10,2)` | Nullable | Monetary reward value in GBP (must be a multiple of £5; enforced at the application layer); NULL for perk rewards |
+| `gift_card_url` | `Text` | Nullable, Globally Unique | HTTPS gift card redemption URL — globally unique one-time-use voucher link; NULL until Bravo staff issues the voucher |
+| `gift_card_sent_at` | `DateTime (tz)` | Nullable | Timestamp when Bravo sent the gift card voucher link to the nominee |
+| `predefined_perk_name` | `String(200)` | Nullable | **Immutable snapshot** of the perk name at reward time, copied from `rnr_config.predefined_perks[*].name`. Historical records remain unaffected if the org later edits the perk catalogue. *Replaces the deleted FK `perk_uuid → rnr_perks.uuid`.* |
+| `predefined_perk_emoji` | `String(10)` | Nullable | **Immutable snapshot** of the perk emoji at reward time, copied from `rnr_config.predefined_perks[*].emoji`. Stored alongside the name so the reward card can be re-rendered without looking up the live catalogue. *Replaces the deleted FK `perk_uuid → rnr_perks.uuid`.* |
+| `custom_perk_text` | `Text` | Nullable | Free-text description for ad-hoc perks not drawn from the predefined catalogue (e.g. `"Team lunch at a restaurant of your choice"`) |
+| `is_claimed` | `Boolean` | NOT NULL, default=False | Whether the gift card has been claimed/redeemed by the nominee |
+| `claimed_at` | `DateTime (tz)` | Nullable | Timestamp when the nominee redeemed the gift card |
+| `given_by_uuid` | `String` | FK → `user_org_memberships.uuid`, NOT NULL | Membership UUID of the R&R admin who gave this reward |
+| `given_at` | `DateTime (tz)` | NOT NULL, default=now | Timestamp when the reward was formally given |
+
+> **SQLAlchemy `__table_args__` Note:** `reward_type` requires:
+> `CheckConstraint("reward_type IN ('money', 'perk')", name='ck_rnr_rewards_reward_type')`
+
+#### Relationships
+
+| Name | Target | Type | Description | Cascade Behavior |
+|---|---|---|---|---|
+| `nomination` | `RnrNomination` | One-to-One | The parent nomination this reward is attached to | `ON DELETE RESTRICT` — nomination cannot be deleted while a reward row exists |
+| `given_by` | `UserOrgMembership` | Many-to-One | The R&R admin who gave the reward | `ON DELETE RESTRICT` — membership cannot be deleted while rewards exist |
+
+#### Indexes & Constraints
+
+| Name | Columns | Type |
+|---|---|---|
+| `uq_rnr_rewards_nomination` | `nomination_uuid` | Unique — enforces strict 1:1 with `rnr_nominations`; one reward per nomination |
+| `idx_rnr_rewards_gift_url` | `gift_card_url` WHERE `gift_card_url IS NOT NULL` | Partial Unique — globally unique gift card URLs |
+
+---
+
+### `rnr_budget_individual`
+
+**Business Purpose:** **Append-only budget ledger** for `per_user` reward pot mode. Budget is assigned to a specific R&R admin membership. Corrections are made via reversal entries — **never UPDATE or DELETE committed rows**. Summing all entries for a membership gives the current spendable balance.
+
+**Base Class:** `db.Model` + `UserAuditMixin`
+
+> ⚡ **Ledger Rule:** This table deliberately does **not** extend `Base` to prevent accidental `save()` / `update_multiple_property_by_uuid()` mutations via the standard ORM helpers. All writes must go through a dedicated `BudgetService` that enforces append-only semantics. Apply a `SqlAlchemyEventMixin.on_before_update` guard or a PostgreSQL rule to block UPDATEs at the DB layer.
+
+#### Columns
+
+| Name | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `BigInteger` | PK, auto-increment | Surrogate primary key |
+| `uuid` | `String` | Unique | Public identifier |
+| `org_uuid` | `String` | FK → `organisations.uuid`, NOT NULL | Tenant scoping |
+| `membership_uuid` | `String` | FK → `user_org_memberships.uuid`, NOT NULL | R&R admin whose budget this ledger entry belongs to |
+| `entry_type` | `String(15)` | NOT NULL, CHECK IN (`credit`, `debit`, `adjustment`, `correction`, `employee_return`) | Ledger entry type: `credit` = budget added; `debit` = reward given; `adjustment` = admin correction; `correction` = reversal entry; `employee_return` = unused budget returned |
+| `amount` | `Numeric(10,2)` | NOT NULL | Monetary value — positive for credits, negative for debits |
+| `notes` | `Text` | Nullable | Optional note explaining the entry (required for `correction` and `adjustment` types) |
+| `reference_uuid` | `String` | Nullable | UUID of the related `rnr_nominations` or `rnr_rewards` row for audit traceability |
+| `created_by` | `String` | FK → `users.uuid`, NOT NULL | User who created the entry; `credit` entries must be created by `bravo_staff` only |
+| `created_at` | `DateTime (tz)` | NOT NULL, default=now | Entry creation timestamp |
+
+> **SQLAlchemy `__table_args__` Note:** `entry_type` requires:
+> `CheckConstraint("entry_type IN ('credit','debit','adjustment','correction','employee_return')", name='ck_rnr_budget_individual_entry_type')`
+
+#### Indexes & Constraints
+
+| Name | Columns | Type |
+|---|---|---|
+| `idx_rnr_budget_ind_org` | `org_uuid` | Index |
+| `idx_rnr_budget_ind_membership` | `membership_uuid` | Index |
+| *(App/DB rule)* | No UPDATE or DELETE | Append-only enforcement |
+
+#### Query Pattern
+
+> **Balance Query — `per_user` mode:**
+
+```python
+from sqlalchemy import func
+from app.models.rnr_budget_individual import RnrBudgetIndividual
+
+def get_individual_balance(db_session, membership_uuid: str, org_uuid: str) -> float:
+    """Return current R&R budget balance for a given membership (per_user mode)."""
+    result = db_session.query(
+        func.coalesce(func.sum(RnrBudgetIndividual.amount), 0)
+    ).filter(
+        RnrBudgetIndividual.membership_uuid == membership_uuid,
+        RnrBudgetIndividual.org_uuid == org_uuid,
+    ).scalar()
+    return float(result)
+```
+
+#### Append-Only Guard
+
+```python
+from sqlalchemy import event
+
+@event.listens_for(RnrBudgetIndividual, 'before_update')
+def prevent_budget_individual_update(mapper, connection, target):
+    """Append-only ledger guard — raises immediately on any attempted UPDATE."""
+    raise RuntimeError(
+        f"[RnrBudgetIndividual] Immutable ledger violation: attempted UPDATE on "
+        f"budget_id={target.id} (uuid={target.uuid}). "
+        "Use a reversal entry (entry_type='correction') instead."
+    )
+```
+
+> For an additional DB-layer safety net:
+> ```sql
+> CREATE RULE no_update_rnr_budget_individual
+>     AS ON UPDATE TO rnr_budget_individual DO INSTEAD NOTHING;
+> ```
+
+---
+
+### `rnr_budget_team`
+
+**Business Purpose:** **Append-only budget ledger** for `per_team` reward pot mode. Budget is held against the R&R team (shared pool across all admins in the team). Same append-only rules apply as `rnr_budget_individual`. A company cannot mix pot modes — `rnr_config.reward_pot_mode` is org-wide and mutually exclusive.
+
+**Base Class:** `db.Model` + `UserAuditMixin`
+
+> ⚡ **Ledger Rule:** Same append-only constraints as `rnr_budget_individual`. Apply a `before_update` event listener and/or PostgreSQL rule. All writes must go through `BudgetService`.
+
+#### Columns
+
+| Name | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `BigInteger` | PK, auto-increment | Surrogate primary key |
+| `uuid` | `String` | Unique | Public identifier |
+| `org_uuid` | `String` | FK → `organisations.uuid`, NOT NULL | Tenant scoping |
+| `rnr_team_uuid` | `String` | FK → `rnr_teams.uuid`, NOT NULL | R&R team whose budget this ledger entry belongs to |
+| `entry_type` | `String(15)` | NOT NULL, CHECK IN (`credit`, `debit`, `adjustment`, `correction`, `employee_return`) | Ledger entry type — same semantics as `rnr_budget_individual.entry_type` |
+| `amount` | `Numeric(10,2)` | NOT NULL | Monetary value — positive for credits, negative for debits |
+| `notes` | `Text` | Nullable | Optional note explaining the entry |
+| `reference_uuid` | `String` | Nullable | UUID of the related `rnr_nominations` or `rnr_rewards` row |
+| `created_by` | `String` | FK → `users.uuid`, NOT NULL | User who created the entry; `credit` entries must be created by `bravo_staff` only |
+| `created_at` | `DateTime (tz)` | NOT NULL, default=now | Entry creation timestamp |
+
+> **SQLAlchemy `__table_args__` Note:** `entry_type` requires:
+> `CheckConstraint("entry_type IN ('credit','debit','adjustment','correction','employee_return')", name='ck_rnr_budget_team_entry_type')`
+
+#### Indexes & Constraints
+
+| Name | Columns | Type |
+|---|---|---|
+| `idx_rnr_budget_team_org` | `org_uuid` | Index |
+| `idx_rnr_budget_team_team` | `rnr_team_uuid` | Index |
+| *(App/DB rule)* | No UPDATE or DELETE | Append-only enforcement |
+
+#### Query Pattern
+
+> **Balance Query — `per_team` mode:**
+
+```python
+from sqlalchemy import func
+from app.models.rnr_budget_team import RnrBudgetTeam
+
+def get_team_balance(db_session, rnr_team_uuid: str, org_uuid: str) -> float:
+    """Return current R&R budget balance for a given R&R team (per_team mode)."""
+    result = db_session.query(
+        func.coalesce(func.sum(RnrBudgetTeam.amount), 0)
+    ).filter(
+        RnrBudgetTeam.rnr_team_uuid == rnr_team_uuid,
+        RnrBudgetTeam.org_uuid == org_uuid,
+    ).scalar()
+    return float(result)
+```
+
+#### Append-Only Guard
+
+```python
+from sqlalchemy import event
+
+@event.listens_for(RnrBudgetTeam, 'before_update')
+def prevent_budget_team_update(mapper, connection, target):
+    """Append-only ledger guard — raises immediately on any attempted UPDATE."""
+    raise RuntimeError(
+        f"[RnrBudgetTeam] Immutable ledger violation: attempted UPDATE on "
+        f"budget_id={target.id} (uuid={target.uuid}). "
+        "Use a reversal entry (entry_type='correction') instead."
+    )
+```
+
+> For an additional DB-layer safety net:
+> ```sql
+> CREATE RULE no_update_rnr_budget_team
+>     AS ON UPDATE TO rnr_budget_team DO INSTEAD NOTHING;
+> ```
+
+---
+
 ## Deleted Tables — Migration Notes
 
 The following tables from the previous schema version have been **removed** and their data migrated into JSONB columns on surviving tables. This section serves as a migration reference for developers writing Alembic migrations.
@@ -1167,6 +1608,7 @@ The following tables from the previous schema version have been **removed** and 
 | `benefit_tokens` | `master_benefits.required_tokens` (JSONB Array) | Aggregate all token definitions per `benefit_uuid` into the array. |
 | `org_benefit_token_answers` | `org_benefits.token_answers` (JSONB Object) | For each `org_benefit_uuid`, build a `{token_key: answer_value}` map by joining `org_benefit_token_answers` → `benefit_tokens` on `token_uuid`. |
 | `custom_benefit_team_access` | `custom_tiles.visible_to_team_uuids` (JSONB Array) | Aggregate `team_uuid` values per `custom_benefit_uuid` into the array. Empty array = visible to all (preserve existing semantics). |
+| `rnr_perks` | `rnr_config.predefined_perks` (JSONB Array) | Aggregate all active and inactive perks per `org_uuid` into the array, mapping `perk_name` → `name`, `perk_emoji` → `emoji`, `is_active` → `is_active`. Also backfill `rnr_rewards.predefined_perk_name` and `rnr_rewards.predefined_perk_emoji` by joining `rnr_rewards.perk_uuid → rnr_perks.uuid` for all existing rows, then drop `rnr_rewards.perk_uuid` FK column. |
 
 ---
 
@@ -1187,11 +1629,23 @@ organisations (root tenant)
 ├── custom_tiles
 │   └── visible_to_team_uuids [JSONB array of org_teams.uuid]
 │
-└── TRS Stack
-    ├── trs_config
-    ├── trs_components     ──── trs_component_types (platform)
-    ├── trs_employee_data  ──── user_org_memberships + trs_components
-    └── trs_statements     ──── user_org_memberships
+├── TRS Stack
+│   ├── trs_config
+│   ├── trs_components     ──── trs_component_types (platform)
+│   ├── trs_employee_data  ──── user_org_memberships + trs_components
+│   └── trs_statements     ──── user_org_memberships
+│
+└── R&R Stack
+    ├── rnr_config
+    │   ├── predefined_perks  [JSONB array — replaces rnr_perks table]
+    │   └── rules_data        [JSONB supplement of flat rule columns]
+    ├── rnr_teams
+    │   └── rnr_user_teams    ──── user_org_memberships
+    ├── rnr_values
+    ├── rnr_nominations       ──── user_org_memberships + rnr_values
+    │   └── rnr_rewards (1:1) ──── user_org_memberships
+    ├── rnr_budget_individual ──── user_org_memberships  [append-only ledger]
+    └── rnr_budget_team       ──── rnr_teams             [append-only ledger]
 
 Platform-level lookups (no org_uuid):
   groups, sectors, lead_sources, trs_component_types, image (stock)
@@ -1226,6 +1680,14 @@ Execute Alembic migrations in the following dependency order to respect FK const
 20. trs_components               (FK → organisations, trs_component_types)
 21. trs_employee_data            (FK → user_org_memberships, trs_components)
 22. trs_statements               (FK → user_org_memberships)
+23. rnr_teams                    (FK → organisations)
+24. rnr_config                   (FK → organisations, image)
+25. rnr_values                   (FK → organisations, image)
+26. rnr_user_teams               (FK → user_org_memberships, rnr_teams)
+27. rnr_nominations              (FK → user_org_memberships, rnr_values, users)
+28. rnr_rewards                  (FK → rnr_nominations, user_org_memberships)
+29. rnr_budget_individual        (FK → organisations, user_org_memberships, users)
+30. rnr_budget_team              (FK → organisations, rnr_teams, users)
 ```
 
 ---
@@ -1236,4 +1698,5 @@ Execute Alembic migrations in the following dependency order to respect FK const
 |---|---|---|
 | April 28, 2026 | Architecture Review | Initial standardized schema (`bravo_benefits_standardized.md`) published |
 | May 1, 2026 | Architecture Review | **This document.** Applied full refactor: (1) Deleted 8 tables (`two_fa_policy`, `sso_config`, `notification_preferences`, `employee_favourite_benefits`, `benefit_resources`, `benefit_tokens`, `org_benefit_token_answers`, `custom_benefit_team_access`) with data migrated to JSONB columns on parent tables. (2) Added `organisations.force_2fa_for_all` as dedicated top-level Boolean. (3) Added `organisations.settings` JSONB consolidating branding, features, and SSO config. (4) Added `user_org_memberships.notification_preferences` and `favourite_benefit_uuids` JSONB columns. (5) Added `master_benefits.data`, `resources`, `required_tokens` JSONB columns; removed 17 flat columns. (6) Added `org_benefits.data` and `token_answers` JSONB columns; removed 5 flat columns. (7) Renamed `custom_benefits` → `custom_tiles`; added `visible_to_team_uuids` JSONB Array. (8) Renamed `image_library` → `image` throughout. (9) Documented `trs_statements.snapshot_json` key-level structure. (10) Scope restricted to Domain 1 and Domain 2 only. |
+| May 4, 2026 | Architecture Review | **Domain 3 (R&R) added.** Changes: (1) Deleted `rnr_perks` standalone table — migrated perk catalogue into `rnr_config.predefined_perks` JSONB array; backfilled `rnr_rewards.predefined_perk_name` / `predefined_perk_emoji` snapshot columns from existing `perk_uuid` FK joins, then dropped `rnr_rewards.perk_uuid`. (2) Added `rnr_config.predefined_perks` JSONB array (replaces `rnr_perks`). (3) Added `rnr_config.rules_data` JSONB supplement for `approve_before_publish`, `allow_money_rewards`, `allow_perk_rewards`, `acknowledge_birthdays`, `acknowledge_long_service` — flat columns retained as authoritative source. (4) Added `rnr_rewards.predefined_perk_name` and `predefined_perk_emoji` immutable snapshot columns. (5) Removed `rnr_rewards.perk_uuid` FK. (6) Retained `rnr_rewards.custom_perk_text` for free-text ad-hoc perks. (7) Documented strict 1:1 relationship between `rnr_nominations` and `rnr_rewards` with UNIQUE constraint on `rnr_rewards.nomination_uuid`; documented soft-delete guard requiring service-layer check before setting `is_deleted=True` on any nomination with a linked reward. (8) Tables `rnr_teams`, `rnr_user_teams`, `rnr_values`, `rnr_budget_individual`, `rnr_budget_team` carried forward unchanged. (9) Scope updated to Domain 1 · Domain 2 · Domain 3. |
 
