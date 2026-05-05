@@ -78,7 +78,6 @@
 6. [Deleted Tables — Migration Notes](#deleted-tables--migration-notes)
 7. [Entity Relationship Summary](#entity-relationship-summary)
 8. [Migration Order](#migration-order)
-9. [Decision History & Changelog](#decision-history--changelog)
 
 ---
 
