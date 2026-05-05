@@ -5,7 +5,7 @@
 > **Database:** PostgreSQL (via SQLAlchemy / Flask-SQLAlchemy)
 > **Source Schema:** `bravo_benefits_standardized.md` (April 28, 2026) — post-architecture-review refactor
 > **Standard Applied:** Flask Boilerplate `DB_SCHEMA.md` architectural conventions
-> **Scope:** Domain 1 — Core Identity & Auth · Domain 2 — Benefits & TRS · Domain 3 — Reward & Recognition
+> **Scope:** Domain 1 — Core Identity & Auth · Domain 2 — Benefits & TRS · Domain 3 — Reward & Recognition · Domain 4 — Content, Support & Marketing · Domain 5 — Platform Config & Scheduling · Domain 6 — Analytics
 
 ---
 
@@ -53,6 +53,28 @@
    - [rnr_budget_individual](#rnr_budget_individual)
    - [rnr_budget_team](#rnr_budget_team)
 
+   **Domain 4 — Content, Support & Marketing**
+   - [documents](#documents)
+   - [notices](#notices)
+   - [notice_likes](#notice_likes)
+   - [support_tickets](#support_tickets)
+   - [support_ticket_messages](#support_ticket_messages)
+   - [notifications](#notifications)
+   - [templates](#templates)
+   - [marketing_categories](#marketing_categories)
+   - [marketing_assets](#marketing_assets)
+   - [adverts](#adverts)
+   - [advert_user_suppression](#advert_user_suppression)
+   - [fact_sheets](#fact_sheets)
+   - [internal_conversations](#internal_conversations)
+   - [internal_messages](#internal_messages)
+
+   **Domain 5 — Platform Config & Scheduling**
+   - [scheduled_jobs](#scheduled_jobs)
+
+   **Domain 6 — Analytics**
+   - [analytics_events](#analytics_events)
+
 6. [Deleted Tables — Migration Notes](#deleted-tables--migration-notes)
 7. [Entity Relationship Summary](#entity-relationship-summary)
 8. [Migration Order](#migration-order)
@@ -68,6 +90,10 @@ The **Bravo Benefits Platform** is a multi-tenant SaaS application providing emp
 |---|---|---|
 | **Core Identity & Auth** | `groups`, `sectors`, `lead_sources`, `organisations`, `users`, `user_org_memberships`, `org_teams`, `user_org_teams`, `org_internal_notes`, `image` | Identity, authentication, org structure, branding, and SSO |
 | **Benefits & TRS** | `master_benefits`, `benefit_levels`, `org_benefits`, `org_benefit_team_levels`, `custom_tiles`, `benefit_requests`, `employee_benefit_status`, `trs_config`, `trs_component_types`, `trs_components`, `trs_employee_data`, `trs_statements` | Benefit catalogue, org offerings, and Total Reward Statements |
+| **Reward & Recognition** | `rnr_config`, `rnr_teams`, `rnr_user_teams`, `rnr_values`, `rnr_nominations`, `rnr_rewards`, `rnr_budget_individual`, `rnr_budget_team` | Peer recognition, wall of fame, reward budgets, and perk catalogue |
+| **Content, Support & Marketing** | `documents`, `notices`, `notice_likes`, `support_tickets`, `support_ticket_messages`, `notifications`, `templates`, `marketing_categories`, `marketing_assets`, `adverts`, `advert_user_suppression`, `fact_sheets`, `internal_conversations`, `internal_messages` | Employee communications, support workflow, internal broadcast messaging, marketing library, adverts, and health content |
+| **Platform Config & Scheduling** | `scheduled_jobs` | Background job queue for all time-based platform operations |
+| **Analytics** | `analytics_events` | Range-partitioned raw event log powering self-serve analytics dashboards |
 
 
 ---
@@ -100,7 +126,6 @@ Users flagged `is_bravo_user=True` on the `users` table are Bravo platform staff
 > **Key Design Rules:**
 > - Never query a business table without an `org_uuid` filter unless explicitly performing a Bravo-staff or admin operation.
 > - `org_teams` (benefit-access teams) are entirely distinct from any R&R team concept — never merge them.
-> - `organisations.force_2fa_for_all` is a **dedicated top-level Boolean column** (not inside `settings` JSONB) because it is queried at every authentication middleware invocation and must remain a first-class indexed field.
 
 ---
 
@@ -265,6 +290,8 @@ Recommended for: `users`, `user_org_memberships` — models with complex domain 
 
 **Business Purpose:** Root tenant entity representing a client company. Every piece of business data in the platform is scoped to an organisation via `org_uuid`. Does **not** extend `Base` — avoids circular FK dependencies since `Base` itself has `org_uuid → organisations.uuid`. Branding, feature flags, and SSO configuration are all consolidated into the `settings` JSONB column to reduce table width and group related configuration logically.
 
+> **2FA Policy Note:** The `force_2fa_for_all` column has been **removed**. Two-factor authentication is now exclusively a user-level choice managed via `users.two_fa_enabled`. There is no org-level 2FA enforcement — individual users opt in or out via their own account settings.
+
 **Base Class:** `db.Model` + `UserAuditMixin`
 
 > ⚡ **Naming Note:** The Bravo schema uses `organisations` (British English). The public FK reference throughout the codebase is `org_uuid` (standardized from the original `org_id`). The internal `id` (BigInteger PK) and `uuid` (String, unique) follow standard boilerplate conventions.
@@ -286,7 +313,6 @@ Recommended for: `users`, `user_org_memberships` — models with complex domain 
 | `launch_date` | `Date` | Nullable | The date the platform formally launched for this org's employees; used in onboarding scheduling |
 | `employee_count` | `Integer` | Nullable | Expected or actual headcount; used for license sizing and bulk upload validation |
 | `self_registration_url` | `Text` | Unique, Nullable | Unique URL slug used for employee self-registration without an admin invite |
-| `force_2fa_for_all` | `Boolean` | NOT NULL, default=False | **Dedicated top-level column** — when True, every user in this org is required to complete 2FA on login, regardless of their personal 2FA setting. Queried at every auth middleware invocation and must remain a first-class indexed field, not buried in JSONB |
 | `settings` | `JSONB` | NOT NULL, default=`{}` | Consolidated org configuration blob. Contains three sub-objects: `branding` (visual identity), `features` (module feature flags), and `sso` (single sign-on configuration). See **`settings` JSONB Structure** below |
 | `status` | `String(20)` | NOT NULL, default=`active`, CHECK IN (`active`, `suspended`, `closed`) | Organisation lifecycle status — `suspended` blocks employee logins while retaining data; `closed` triggers GDPR retention clock |
 | `closed_at` | `DateTime (tz)` | Nullable | Timestamp when this org was formally closed; triggers the GDPR data retention deadline calculation |
@@ -304,6 +330,7 @@ Recommended for: `users`, `user_org_memberships` — models with complex domain 
 
 #### `settings` JSONB Structure
 
+
 The `settings` column stores three logically grouped sub-objects. Developers should access nested values via `org.settings.get('branding', {}).get('logo_url')` pattern with safe fallbacks.
 
 ```json
@@ -316,12 +343,17 @@ The `settings` column stores three logically grouped sub-objects. Developers sho
     "welcome_message":   "<string|null>"
   },
   "features": {
-    "show_adverts":        "<boolean>",
-    "show_fact_sheets":    "<boolean>",
-    "is_bravo_broker":     "<boolean>",
-    "is_trs_enabled":      "<boolean>",
-    "is_rnr_enabled":      "<boolean>",
-    "ni_number_mandatory": "<boolean>"
+    "show_adverts":                "<boolean>",
+    "show_fact_sheets":            "<boolean>",
+    "is_bravo_broker":             "<boolean>",
+    "is_trs_enabled":              "<boolean>",
+    "is_rnr_enabled":              "<boolean>",
+    "ni_number_mandatory":         "<boolean>",
+    "is_teams_enabled":            "<boolean>",
+    "is_notices_enabled":          "<boolean>",
+    "is_documents_enabled":        "<boolean>",
+    "is_analytics_enabled":        "<boolean>",
+    "is_internal_messages_enabled":"<boolean>"
   },
   "sso": {
     "provider":      "<string|null>",
@@ -347,6 +379,11 @@ The `settings` column stores three logically grouped sub-objects. Developers sho
 | `features.is_trs_enabled` | `Boolean` | `false` | Master feature flag enabling the Total Reward Statement module (chargeable add-on). When False, all TRS routes return 403 for this org's users. *Migrated from removed `is_trs_enabled`.* |
 | `features.is_rnr_enabled` | `Boolean` | `false` | Master feature flag enabling the Reward & Recognition module. When False, all R&R routes return 403 for this org's users. *Migrated from removed `is_rnr_enabled`.* |
 | `features.ni_number_mandatory` | `Boolean` | `true` | When True, NI number is a required field on employee bulk upload and the profile form; set to False for orgs with non-UK employees who do not have NI numbers. *Migrated from removed `ni_number_mandatory`.* |
+| `features.is_teams_enabled` | `Boolean` | `false` | Master feature flag enabling the Org Teams module for this organisation. When False, team management routes and benefit team-level assignment UIs are hidden. |
+| `features.is_notices_enabled` | `Boolean` | `false` | Master feature flag enabling the Notices module. When False, the notices section is hidden from the employee portal and org admin UI. |
+| `features.is_documents_enabled` | `Boolean` | `false` | Master feature flag enabling the Documents module. When False, document upload, listing, and download routes return 403 for this org's users. |
+| `features.is_analytics_enabled` | `Boolean` | `false` | Master feature flag enabling the self-serve Analytics dashboard for this organisation. When False, analytics routes and the dashboard tab are hidden from org admins. |
+| `features.is_internal_messages_enabled` | `Boolean` | `false` | Master feature flag enabling the Internal Conversations (broadcast messaging) module. When False, `internal_conversations` and `internal_messages` routes are disabled for this org. |
 | `sso.provider` | `String` | `null` | SSO provider type. Allowed values: `google`, `microsoft`, `okta`, `saml`, `other`. *Migrated from deleted `sso_config.provider`.* |
 | `sso.is_enabled` | `Boolean` | `false` | Whether SSO login is currently active for this organisation. When True, password-based login is suppressed. *Migrated from deleted `sso_config.is_enabled`.* |
 | `sso.client_id` | `String` | `null` | OAuth client ID issued by the SSO provider. *Migrated from deleted `sso_config.client_id`.* |
@@ -370,7 +407,6 @@ The `settings` column stores three logically grouped sub-objects. Developers sho
 |---|---|---|
 | `idx_orgs_group` | `group_uuid` | Index |
 | `idx_orgs_status` | `status` | Index |
-| `idx_orgs_force_2fa` | `force_2fa_for_all` | Index — queried on every auth check |
 | *(standard)* | `uuid` | Unique |
 
 ---
@@ -393,7 +429,7 @@ The `settings` column stores three logically grouped sub-objects. Developers sho
 | `first_name` | `String(100)` | NOT NULL, default=`""` | User's first name; replaced with `"Name Removed"` on GDPR anonymisation at account closure |
 | `last_name` | `String(100)` | NOT NULL, default=`""` | User's last name; scrambled on GDPR anonymisation |
 | `is_bravo_user` | `Boolean` | NOT NULL, default=False | Marks this account as a Bravo platform staff member; bypasses all `org_uuid` filter injection in `Base.get_base_query()` |
-| `two_fa_enabled` | `Boolean` | NOT NULL, default=False | Whether the user has personally enabled 2FA via TOTP setup; overridden by `organisations.force_2fa_for_all` at auth time |
+| `two_fa_enabled` | `Boolean` | NOT NULL, default=False | Whether the user has personally enabled 2FA via TOTP setup. This is the sole 2FA control — there is no org-level override; 2FA enforcement is a user-level decision only |
 | `two_fa_secret` | `Text` | Nullable | Encrypted TOTP 2FA secret; excluded from all audit log snapshots |
 | `gdpr_anonymised_at` | `DateTime (tz)` | Nullable | Timestamp when PII was anonymised in compliance with GDPR on org closure; signals downstream services to exclude this user from communications |
 | `suppress_all_adverts` | `Boolean` | NOT NULL, default=False | User-level advert suppression override; when True, Bravo adverts are never shown to this user regardless of org settings |
@@ -1594,6 +1630,630 @@ def prevent_budget_team_update(mapper, connection, target):
 
 ---
 
+### Domain 4 — Content, Support & Marketing
+
+---
+
+### `documents`
+
+**Business Purpose:** Employer-uploaded document library. Org admins and group admins upload documents (policy handbooks, benefit guides, etc.) that employees can download. Group admins can push a document across all linked orgs simultaneously via `group_uuid`. Team-scoped visibility is managed directly via the `visible_team_uuids` JSONB array — an empty array means the document is visible to all teams in the org (replacing the deleted `document_team_visibility` join table).
+
+> **Implementation Note:** The `visible_team_uuids` array requires an `after_delete` application hook on the `OrgTeam` model to remove any deleted team UUID from this array across all document rows in the affected org, preventing stale UUID references.
+
+**Base Class:** `Base`
+
+#### Columns
+
+| Name | Type | Constraints | Description |
+|---|---|---|---|
+| *(Base fields)* | — | — | `id`, `uuid`, `org_uuid`, `created_at`, `updated_at`, `deleted_at`, `created_by`, `updated_by`, `deleted_by` |
+| `group_uuid` | `String` | FK → `groups.uuid`, Nullable | When set, this document was pushed by a group admin and is visible to all orgs in the group (`ON DELETE SET NULL`) |
+| `title` | `String(255)` | NOT NULL | Document display title shown in the employee document library |
+| `file_url` | `Text` | NOT NULL | S3 URL of the uploaded document file |
+| `mime_type` | `String(100)` | NOT NULL, CHECK IN allowed types | File MIME type — validated on upload. Allowed values: `application/pdf`, `application/vnd.openxmlformats-officedocument.wordprocessingml.document`, `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`, `text/csv`, `application/vnd.ms-excel`, `application/vnd.openxmlformats-officedocument.presentationml.presentation` |
+| `is_group_document` | `Boolean` | NOT NULL, default=False | Whether this document was pushed by a group admin across all linked orgs |
+| `is_active` | `Boolean` | NOT NULL, default=True | Whether the document is visible to employees; False hides it without soft-deleting |
+| `visible_team_uuids` | `JSONB` | NOT NULL, default=`[]` | Array of `org_teams.uuid` strings restricting visibility to specific teams. An empty array `[]` means the document is visible to **all teams** in the org. Replaces the deleted `document_team_visibility` join table. See **`visible_team_uuids` JSONB Structure** below |
+
+> **SQLAlchemy `__table_args__` Note:** `mime_type` requires a `CheckConstraint`. Given the long values, define it as a named constant:
+> ```python
+> _ALLOWED_MIME_TYPES = (
+>     'application/pdf',
+>     'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+>     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+>     'text/csv',
+>     'application/vnd.ms-excel',
+>     'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+> )
+> CheckConstraint(f"mime_type IN {_ALLOWED_MIME_TYPES}", name='ck_documents_mime_type')
+> ```
+
+#### `visible_team_uuids` JSONB Structure
+
+```json
+["<org_team_uuid_1>", "<org_team_uuid_2>"]
+```
+
+| Key | Type | Description |
+|---|---|---|
+| *(array element)* | `String (UUID)` | UUID string referencing an `org_teams.uuid` value. When the array is populated, only employees who are members of one of these teams (via `user_org_teams`) will see this document. An empty array or `null` means all teams in the org can see it. *Replaces the deleted `document_team_visibility` join table.* |
+
+> **`after_delete` Hook on `OrgTeam`:** When an `OrgTeam` row is deleted, a service-layer hook must iterate all `documents` in that org and remove the deleted team's UUID from every `visible_team_uuids` array. Use a single `UPDATE documents SET visible_team_uuids = visible_team_uuids - '<team_uuid>'::text WHERE org_uuid = '<org_uuid>'` PostgreSQL array-remove expression.
+
+#### Indexes & Constraints
+
+| Name | Columns | Type |
+|---|---|---|
+| `idx_documents_org` | `org_uuid` | Index |
+| `idx_documents_group` | `group_uuid` | Index — used when resolving group-pushed documents |
+
+---
+
+### `notices`
+
+**Business Purpose:** Org or group-level rich HTML notices published to the employee newsfeed. Employees can like notices (tracked separately in `notice_likes`). Group admins can push notices across all linked orgs simultaneously. Team-scoped visibility is managed via the `visible_team_uuids` JSONB array. `like_count` is a denormalised counter maintained by the application for fast, read-optimised feed generation — avoids a COUNT aggregation query on the hot `notice_likes` table on every feed load.
+
+> **Implementation Note:** The `visible_team_uuids` array requires an `after_delete` application hook on the `OrgTeam` model (same pattern as `documents`) to clean up deleted team UUIDs.
+
+**Base Class:** `Base`
+
+#### Columns
+
+| Name | Type | Constraints | Description |
+|---|---|---|---|
+| *(Base fields)* | — | — | `id`, `uuid`, `org_uuid`, `created_at`, `updated_at`, `deleted_at`, `created_by`, `updated_by`, `deleted_by` |
+| `group_uuid` | `String` | FK → `groups.uuid`, Nullable | When set, this notice was pushed by a group admin and is visible to all orgs in the group (`ON DELETE SET NULL`) |
+| `title` | `String(255)` | NOT NULL | Notice headline shown on the employee newsfeed listing |
+| `short_desc` | `String(500)` | Nullable | Summary text shown beneath the title in listing/card views before the employee opens the full notice |
+| `html_content` | `Text` | Nullable | Full rich HTML body of the notice rendered on the notice detail page |
+| `image_uuid` | `String` | FK → `image.uuid`, Nullable | Hero image UUID from the `image` table displayed as the notice card cover (`ON DELETE SET NULL`) |
+| `is_group_notice` | `Boolean` | NOT NULL, default=False | Whether this notice was pushed by a group admin across all linked orgs |
+| `is_active` | `Boolean` | NOT NULL, default=True | Whether the notice is visible to employees; False suppresses it without soft-deleting |
+| `like_count` | `Integer` | NOT NULL, default=0 | Denormalised like counter — incremented/decremented by the application when employees like/unlike. Maintained for fast, read-optimised feed generation; avoids a COUNT query on `notice_likes` on every feed render |
+| `visible_team_uuids` | `JSONB` | NOT NULL, default=`[]` | Array of `org_teams.uuid` strings restricting visibility to specific teams. An empty array `[]` means the notice is visible to **all teams** in the org. Replaces the deleted `notice_team_visibility` join table. See **`visible_team_uuids` JSONB Structure** below |
+
+#### `visible_team_uuids` JSONB Structure
+
+```json
+["<org_team_uuid_1>", "<org_team_uuid_2>"]
+```
+
+| Key | Type | Description |
+|---|---|---|
+| *(array element)* | `String (UUID)` | UUID string referencing an `org_teams.uuid` value. When the array is populated, only employees who are members of one of these teams (via `user_org_teams`) will see this notice. An empty array means all teams in the org can see it. *Replaces the deleted `notice_team_visibility` join table.* |
+
+> **`after_delete` Hook on `OrgTeam`:** Same pattern as `documents.visible_team_uuids` — when an `OrgTeam` is deleted, a service hook removes the deleted UUID from all notice `visible_team_uuids` arrays in the affected org.
+
+#### Indexes & Constraints
+
+| Name | Columns | Type |
+|---|---|---|
+| `idx_notices_org` | `org_uuid` | Index |
+| `idx_notices_group` | `group_uuid` | Index — used when resolving group-pushed notices |
+
+---
+
+### `notice_likes`
+
+**Business Purpose:** Records which employees have liked a notice — one like row per employee per notice. Enforced via composite primary key. The like count itself is stored as the denormalised `notices.like_count` column for fast feed generation; `notice_likes` is the authoritative source of truth for the unique-per-employee constraint and for "did this user like this notice?" queries. This table is designed to handle **concurrent writes** safely — the composite PK provides an implicit unique constraint, and the application uses INSERT … ON CONFLICT DO NOTHING to avoid race conditions when two sessions try to record the same like simultaneously.
+
+**Base Class:** `db.Model` (interaction log — no full `Base` fields required)
+
+#### Columns
+
+| Name | Type | Constraints | Description |
+|---|---|---|---|
+| `notice_uuid` | `String` | FK → `notices.uuid`, NOT NULL | The notice being liked (`ON DELETE CASCADE` — likes removed with the notice) |
+| `membership_uuid` | `String` | FK → `user_org_memberships.uuid`, NOT NULL | The employee who liked the notice |
+| `liked_at` | `DateTime (tz)` | NOT NULL, default=now | Timestamp when the like was recorded |
+
+#### Indexes & Constraints
+
+| Name | Columns | Type |
+|---|---|---|
+| *(composite PK)* | `notice_uuid`, `membership_uuid` | Primary Key — enforces one like per employee per notice |
+
+---
+
+### `support_tickets`
+
+**Business Purpose:** Employee-raised support tickets providing a structured messaging channel between employees and Bravo staff. Supports context-specific tickets (`benefit`, `general`, `system`) and SLA tracking fields (`assigned_at`, `resolved_at`) surfaced on the Bravo staff dashboard. One thread per ticket; individual messages live in `support_ticket_messages`.
+
+**Base Class:** `Base`
+
+#### Columns
+
+| Name | Type | Constraints | Description |
+|---|---|---|---|
+| *(Base fields)* | — | — | `id`, `uuid`, `org_uuid`, `created_at`, `updated_at`, `deleted_at`, `created_by`, `updated_by`, `deleted_by` |
+| `raised_by_uuid` | `String` | FK → `user_org_memberships.uuid`, NOT NULL | Membership of the employee who raised the ticket |
+| `context_type` | `String(10)` | NOT NULL, default=`general`, CHECK IN (`benefit`, `general`, `system`) | Ticket context category: `benefit` = related to a specific benefit; `general` = general enquiry; `system` = platform/technical issue |
+| `related_benefit_uuid` | `String` | FK → `org_benefits.uuid`, Nullable | The specific benefit this ticket concerns — populated when `context_type = benefit` |
+| `subject` | `String(300)` | NOT NULL | Ticket subject line displayed in the Bravo staff ticket list |
+| `status` | `String(15)` | NOT NULL, default=`open`, CHECK IN (`open`, `in_progress`, `resolved`, `cleared`) | Ticket workflow status: `open` = new; `in_progress` = assigned and being worked; `resolved` = answer provided; `cleared` = closed without action |
+| `assigned_to_uuid` | `String` | FK → `users.uuid`, Nullable | Bravo staff member currently assigned to handle this ticket |
+| `assigned_at` | `DateTime (tz)` | Nullable | Timestamp when the ticket was assigned to a Bravo staff member (SLA start) |
+| `resolved_at` | `DateTime (tz)` | Nullable | Timestamp when the ticket was resolved (SLA end); used for resolution time reporting on the Bravo staff dashboard |
+
+> **SQLAlchemy `__table_args__` Note:** The following ENUM columns require `CheckConstraint` entries:
+> - `context_type`: `CheckConstraint("context_type IN ('benefit', 'general', 'system')", name='ck_support_tickets_context_type')`
+> - `status`: `CheckConstraint("status IN ('open', 'in_progress', 'resolved', 'cleared')", name='ck_support_tickets_status')`
+
+#### Relationships
+
+| Name | Target | Type | Description | Cascade Behavior |
+|---|---|---|---|---|
+| `messages` | `SupportTicketMessage` | One-to-Many | All messages in this ticket thread | `ON DELETE CASCADE` — messages removed with the ticket |
+| `raised_by` | `UserOrgMembership` | Many-to-One | The employee who raised the ticket | `ON DELETE RESTRICT` |
+
+#### Indexes & Constraints
+
+| Name | Columns | Type |
+|---|---|---|
+| `idx_tickets_org` | `org_uuid` | Index |
+| `idx_tickets_status` | `status` | Index |
+| `idx_tickets_assigned` | `assigned_to_uuid` WHERE `status != 'resolved'` | Partial Index — drives the Bravo staff open-ticket assignment list |
+
+---
+
+### `support_ticket_messages`
+
+**Business Purpose:** Individual messages within a support ticket thread. Both the employee and Bravo staff write messages here; the `sender_uuid` links to the `users` table (not membership) to capture the Bravo staff identity. Supports optional file attachments. `is_read` drives the unread-message badge on the employee and Bravo staff UIs.
+
+**Base Class:** `Base`
+
+#### Columns
+
+| Name | Type | Constraints | Description |
+|---|---|---|---|
+| *(Base fields)* | — | — | `id`, `uuid`, `org_uuid`, `created_at`, `updated_at`, `deleted_at`, `created_by`, `updated_by`, `deleted_by` |
+| `ticket_uuid` | `String` | FK → `support_tickets.uuid`, NOT NULL | The parent ticket this message belongs to (`ON DELETE CASCADE`) |
+| `sender_uuid` | `String` | FK → `users.uuid`, NOT NULL | The platform user who sent this message — links to `users` (not membership) to support Bravo staff as senders |
+| `body` | `Text` | NOT NULL | Full message content displayed in the ticket thread |
+| `attachment_url` | `Text` | Nullable | Optional S3 URL of a file attached to this message |
+| `is_read` | `Boolean` | NOT NULL, default=False | Whether the recipient has read this message; drives the unread-message notification badge |
+| `sent_at` | `DateTime (tz)` | NOT NULL, default=now | Timestamp when the message was sent; displayed in the thread view |
+
+#### Indexes & Constraints
+
+| Name | Columns | Type |
+|---|---|---|
+| `idx_ticket_messages_ticket` | `ticket_uuid` | Index — used to retrieve all messages for a ticket in thread order |
+
+---
+
+### `notifications`
+
+**Business Purpose:** In-app and push notification feed per user (renamed from `newsfeed_events` to better reflect its dual in-app/push role and allow future SMS/push expansion). Uses a polymorphic `reference_uuid` + `reference_table` pattern to point to the source entity without hard FK constraints. One row per recipient per event — the feed is assembled by querying unread rows for the requesting membership.
+
+**Base Class:** `Base`
+
+> ⚡ **Rename Note:** Renamed from `newsfeed_events`. All FK references, model names, and index names updated accordingly. The rename allows future SMS and push notification channels to be documented under the same table without the name implying a feed-only context.
+
+#### Columns
+
+| Name | Type | Constraints | Description |
+|---|---|---|---|
+| *(Base fields)* | — | — | `id`, `uuid`, `org_uuid`, `created_at`, `updated_at`, `deleted_at`, `created_by`, `updated_by`, `deleted_by` |
+| `recipient_uuid` | `String` | FK → `user_org_memberships.uuid`, NOT NULL | The membership receiving this notification |
+| `event_type` | `String(30)` | NOT NULL, CHECK IN (`notice`, `document`, `message`, `rnr_nomination`, `rnr_wall`, `birthday`, `long_service`, `advert`) | Type of notification event — drives the icon and routing behaviour in the employee notification centre |
+| `reference_uuid` | `String` | Nullable | UUID of the referenced source entity (e.g. the `notice_uuid`, `rnr_nominations.uuid`) |
+| `reference_table` | `String(100)` | Nullable | Table name of the referenced entity — used by the frontend to construct the deep-link URL |
+| `title` | `String(255)` | Nullable | Notification title displayed in the notification centre |
+| `body_preview` | `Text` | Nullable | Short preview text shown beneath the title in the notification list |
+| `is_read` | `Boolean` | NOT NULL, default=False | Whether the employee has read/dismissed this notification; False = drives the unread badge count |
+| `push_sent_at` | `DateTime (tz)` | Nullable | Timestamp when the push notification was dispatched to the mobile device; NULL if no push was sent |
+
+> **SQLAlchemy `__table_args__` Note:** `event_type` requires:
+> ```python
+> CheckConstraint(
+>     "event_type IN ('notice','document','message','rnr_nomination',"
+>     "'rnr_wall','birthday','long_service','advert')",
+>     name='ck_notifications_event_type'
+> )
+> ```
+
+#### Indexes & Constraints
+
+| Name | Columns | Type |
+|---|---|---|
+| `idx_notifications_recipient` | `recipient_uuid`, `is_read`, `created_at DESC` | Composite Index — used for paginated feed queries and unread count |
+
+---
+
+### `templates`
+
+**Business Purpose:** Global HTML email templates managed exclusively by Bravo staff. One record per template type; each `template_type` is unique across the platform. Renamed from `email_templates` to allow future expansion to SMS and push notification templates without a disruptive schema rename.
+
+> ⚡ **Rename Note:** Renamed from `email_templates` to `templates`. All FK references, model names, index names, and constraint names updated accordingly. The rename future-proofs the table for SMS/push template types without schema migration.
+
+**Base Class:** `Base`
+
+#### Columns
+
+| Name | Type | Constraints | Description |
+|---|---|---|---|
+| *(Base fields)* | — | — | `id`, `uuid`, `org_uuid` (NULL — platform-level record), `created_at`, `updated_at`, `deleted_at`, `created_by`, `updated_by`, `deleted_by` |
+| `template_name` | `String(200)` | NOT NULL | Human-readable template name displayed in the Bravo staff template management UI |
+| `template_type` | `String(50)` | Unique, NOT NULL, CHECK IN allowed types | System template identifier — uniquely identifies the template used by email dispatch workers. Allowed values: `welcome`, `self_reg`, `invite_reminder`, `rnr_approval`, `rnr_monthly_roundup`, `rnr_birthday`, `rnr_long_service`, `rnr_team_leader_fortnightly`, `new_document`, `new_notice`, `gift_card`, `trs_ready` |
+| `html_content` | `Text` | NOT NULL | Full HTML email template body including token placeholders for dynamic substitution |
+| `is_active` | `Boolean` | NOT NULL, default=True | Whether this template is active and available for dispatch; inactive templates fall back to the platform default |
+
+> **SQLAlchemy `__table_args__` Note:** `template_type` requires:
+> ```python
+> CheckConstraint(
+>     "template_type IN ('welcome','self_reg','invite_reminder','rnr_approval',"
+>     "'rnr_monthly_roundup','rnr_birthday','rnr_long_service',"
+>     "'rnr_team_leader_fortnightly','new_document','new_notice','gift_card','trs_ready')",
+>     name='ck_templates_template_type'
+> )
+> ```
+
+#### Indexes & Constraints
+
+| Name | Columns | Type |
+|---|---|---|
+| `uq_templates_type` | `template_type` | Unique — one template per type across the platform |
+
+---
+
+### `marketing_categories`
+
+**Business Purpose:** Platform-level taxonomy categories for grouping marketing assets (e.g. `Benefits`, `R&R`, `Wellbeing`). Managed by Bravo staff. Client orgs cannot create or modify categories. Referenced by `marketing_assets.category_uuids` JSONB array.
+
+**Base Class:** `Base`
+
+#### Columns
+
+| Name | Type | Constraints | Description |
+|---|---|---|---|
+| *(Base fields)* | — | — | `id`, `uuid`, `org_uuid` (NULL — platform-level), `created_at`, `updated_at`, `deleted_at`, `created_by`, `updated_by`, `deleted_by` |
+| `category_name` | `String(200)` | NOT NULL | Display name of the category shown in the marketing asset filter UI (e.g. `Benefits`, `Wellbeing`, `R&R`) |
+| `is_active` | `Boolean` | NOT NULL, default=True | Whether this category is active and available as a filter option; inactive categories are hidden from the filter UI but retained for historical asset classification |
+
+---
+
+### `marketing_assets`
+
+**Business Purpose:** Static content library for org launch materials (posters, email templates, graphics, videos). Filterable by launch phase and platform type. Renamed from `marketing_materials` to better reflect that this table stores downloadable creative assets, not generic marketing data. Benefit associations and category assignments are managed as JSONB arrays on this table (replacing the deleted `marketing_benefit_links` and `marketing_category_materials` join tables), with GIN indexes for fast reverse-lookups.
+
+> ⚡ **Rename Note:** Renamed from `marketing_materials`. All FK references, model names, index names, and constraint names updated accordingly.
+
+> **`after_delete` Hook on `MarketingCategory`:** When a `MarketingCategory` is deleted, a service-layer hook must remove the deleted category UUID from `marketing_assets.category_uuids` for all affected rows.
+
+**Base Class:** `Base`
+
+#### Columns
+
+| Name | Type | Constraints | Description |
+|---|---|---|---|
+| *(Base fields)* | — | — | `id`, `uuid`, `org_uuid` (NULL — platform-level), `created_at`, `updated_at`, `deleted_at`, `created_by`, `updated_by`, `deleted_by` |
+| `title` | `String(255)` | NOT NULL | Asset display title shown in the marketing library |
+| `material_type` | `String(10)` | NOT NULL, CHECK IN (`poster`, `email`, `graphic`, `video`) | Format type of the asset |
+| `launch_phase` | `String(5)` | NOT NULL, CHECK IN (`pre`, `post`, `both`) | Whether this asset is for pre-launch, post-launch, or both phases |
+| `platform_type` | `String(10)` | NOT NULL, default=`both`, CHECK IN (`full`, `basic`, `both`) | Applicable platform tier: `full`, `basic`, or `both` |
+| `content_url` | `Text` | Nullable | URL to the downloadable asset (poster PDF, graphic file, video link) |
+| `sender_email` | `String(255)` | Nullable | Sender email address for email-type assets |
+| `subject` | `String(300)` | Nullable | Subject line for email-type assets |
+| `html_content` | `Text` | Nullable | HTML body content for email-type assets |
+| `is_active` | `Boolean` | NOT NULL, default=True | Whether this asset is available for download in the org admin marketing library |
+| `linked_benefit_uuids` | `JSONB` | NOT NULL, default=`[]` | Array of `master_benefits.uuid` strings associating this asset with one or more master benefits. Replaces the deleted `marketing_benefit_links` join table. **Requires a GIN Index** for fast reverse-lookup (find all assets for a given benefit). See **`linked_benefit_uuids` JSONB Structure** below |
+| `category_uuids` | `JSONB` | NOT NULL, default=`[]` | Array of `marketing_categories.uuid` strings categorising this asset. Replaces the deleted `marketing_category_materials` join table. **Requires a GIN Index** for fast reverse-lookup (filter all assets by category). See **`category_uuids` JSONB Structure** below |
+
+> **SQLAlchemy `__table_args__` Note:** The following ENUM columns require `CheckConstraint` entries:
+> - `material_type`: `CheckConstraint("material_type IN ('poster', 'email', 'graphic', 'video')", name='ck_marketing_assets_material_type')`
+> - `launch_phase`: `CheckConstraint("launch_phase IN ('pre', 'post', 'both')", name='ck_marketing_assets_launch_phase')`
+> - `platform_type`: `CheckConstraint("platform_type IN ('full', 'basic', 'both')", name='ck_marketing_assets_platform_type')`
+
+#### `linked_benefit_uuids` JSONB Structure
+
+```json
+["<master_benefit_uuid_1>", "<master_benefit_uuid_2>"]
+```
+
+| Key | Type | Description |
+|---|---|---|
+| *(array element)* | `String (UUID)` | UUID string referencing a `master_benefits.uuid` value. Enables filtering the marketing library by benefit. *Replaces the deleted `marketing_benefit_links` join table.* |
+
+#### `category_uuids` JSONB Structure
+
+```json
+["<marketing_category_uuid_1>", "<marketing_category_uuid_2>"]
+```
+
+| Key | Type | Description |
+|---|---|---|
+| *(array element)* | `String (UUID)` | UUID string referencing a `marketing_categories.uuid` value. Enables filtering the marketing library by category. *Replaces the deleted `marketing_category_materials` join table.* |
+
+> **`after_delete` Hook on `MarketingCategory`:** When a `MarketingCategory` row is deleted, a service hook must remove the deleted UUID from `marketing_assets.category_uuids` across all affected rows, using a PostgreSQL array-remove expression.
+
+#### Indexes & Constraints
+
+| Name | Columns | Type |
+|---|---|---|
+| `idx_marketing_assets_linked_benefits` | `linked_benefit_uuids` | **GIN Index** — required for fast reverse-lookup: find all assets linked to a given `master_benefit_uuid` |
+| `idx_marketing_assets_categories` | `category_uuids` | **GIN Index** — required for fast reverse-lookup: filter all assets belonging to a given category |
+
+---
+
+### `adverts`
+
+**Business Purpose:** Runtime user-facing adverts shown to employees in the Bravo portal (distinct from marketing assets — different lifecycle, different query patterns). Managed by Bravo staff. Org targeting is managed via the `target_org_uuids` JSONB array (replacing the deleted `advert_org_targets` join table). Per-user suppression (employee dismissals) is tracked separately in `advert_user_suppression`.
+
+**Base Class:** `Base`
+
+#### Columns
+
+| Name | Type | Constraints | Description |
+|---|---|---|---|
+| *(Base fields)* | — | — | `id`, `uuid`, `org_uuid` (NULL = platform-wide), `created_at`, `updated_at`, `deleted_at`, `created_by`, `updated_by`, `deleted_by` |
+| `name` | `String(200)` | NOT NULL | Internal advert name used in the Bravo staff advert management UI |
+| `body_text` | `Text` | Nullable | Advert body copy displayed to the employee in the portal |
+| `image_url` | `Text` | Nullable | URL of the advert image displayed in the employee portal |
+| `cta_link` | `Text` | Nullable | Call-to-action URL opened when the employee clicks the advert |
+| `target_type` | `String(20)` | NOT NULL, default=`all`, CHECK IN (`all`, `specific_orgs`, `specific_benefit`) | Targeting mode: `all` = shown to every eligible employee; `specific_orgs` = only shown to employees in the listed orgs in `target_org_uuids`; `specific_benefit` = shown only to employees whose org has the targeted benefit |
+| `target_benefit_uuid` | `String` | FK → `master_benefits.uuid`, Nullable | The master benefit used for targeting when `target_type = specific_benefit` (`ON DELETE SET NULL`) |
+| `is_active` | `Boolean` | NOT NULL, default=True | Whether the advert is currently live and eligible to be served to employees |
+| `target_org_uuids` | `JSONB` | NOT NULL, default=`[]` | Array of `organisations.uuid` strings restricting advert delivery to specific orgs. Used when `target_type = specific_orgs`. An empty array means the `target_type` takes precedence (i.e. `all` or `specific_benefit`). Replaces the deleted `advert_org_targets` join table. **Requires a GIN Index** for fast eligibility lookup. See **`target_org_uuids` JSONB Structure** below |
+
+> **SQLAlchemy `__table_args__` Note:** `target_type` requires:
+> `CheckConstraint("target_type IN ('all', 'specific_orgs', 'specific_benefit')", name='ck_adverts_target_type')`
+
+#### `target_org_uuids` JSONB Structure
+
+```json
+["<org_uuid_1>", "<org_uuid_2>"]
+```
+
+| Key | Type | Description |
+|---|---|---|
+| *(array element)* | `String (UUID)` | UUID string referencing an `organisations.uuid` value. When `target_type = specific_orgs`, the advert is served only to employees whose `org_uuid` appears in this array. An empty array in combination with `target_type = all` means the advert is served platform-wide. *Replaces the deleted `advert_org_targets` join table.* |
+
+#### Indexes & Constraints
+
+| Name | Columns | Type |
+|---|---|---|
+| `idx_adverts_active` | `is_active` WHERE `is_active = True AND deleted_at IS NULL` | Partial Index — used by the advert eligibility query on every page load |
+| `idx_adverts_target_org_uuids` | `target_org_uuids` | **GIN Index** — required for fast reverse-lookup: find all adverts targeting a given `org_uuid` |
+
+---
+
+### `advert_user_suppression`
+
+**Business Purpose:** Per-user advert suppression — tracks which employees have dismissed a specific advert so it is not shown again. Designed to handle **high-concurrency dismissals** safely: the composite unique constraint on `(advert_uuid, membership_uuid)` means concurrent dismissal attempts by the same user (e.g. double-tap) are safely idempotent via INSERT … ON CONFLICT DO NOTHING, without row-locking the main `adverts` table.
+
+**Base Class:** `Base`
+
+#### Columns
+
+| Name | Type | Constraints | Description |
+|---|---|---|---|
+| *(Base fields)* | — | — | `id`, `uuid`, `org_uuid`, `created_at`, `updated_at`, `deleted_at`, `created_by`, `updated_by`, `deleted_by` |
+| `advert_uuid` | `String` | FK → `adverts.uuid`, NOT NULL | The advert the employee has dismissed (`ON DELETE CASCADE`) |
+| `membership_uuid` | `String` | FK → `user_org_memberships.uuid`, NOT NULL | The employee who dismissed the advert |
+| `suppress_advert` | `Boolean` | NOT NULL, default=True | Suppression flag — True means this advert must not be served to this employee; retained as a boolean (rather than just a row presence check) to allow future re-activation flows if needed |
+
+#### Indexes & Constraints
+
+| Name | Columns | Type |
+|---|---|---|
+| `uq_advert_user_suppression` | `advert_uuid`, `membership_uuid` | Unique — one suppression record per employee per advert; enables safe idempotent upserts |
+| `idx_advert_suppression_membership` | `membership_uuid` | Index — used to look up all suppressed adverts for a given employee |
+
+---
+
+### `fact_sheets`
+
+**Business Purpose:** Platform-level health and wellbeing content tiles created exclusively by Bravo staff. Displayed at the bottom of the employee benefit view as curated reading. No `org_uuid` — these are platform-wide records visible to all orgs. Org-level visibility is controlled by `organisations.settings.features.show_fact_sheets` — an organisation either sees **all** fact sheets or **none** (no selective per-team assignment per PRD Module 9).
+
+**Base Class:** `db.Model` + `UserAuditMixin` (platform-level lookup — no org tenancy)
+
+> **PRD Module 9:** Fact sheets are Bravo-only content (client orgs cannot create them). The visibility toggle is all-or-nothing at the org level — there is no per-team or per-benefit selective assignment.
+
+#### Columns
+
+| Name | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `BigInteger` | PK, auto-increment | Internal surrogate primary key |
+| `uuid` | `String` | Unique | Public identifier used in API responses and deep-links |
+| `title` | `String(200)` | NOT NULL | Fact sheet display title shown on the content tile |
+| `body_html` | `Text` | NOT NULL, default=`""` | Rich HTML body content rendered on the fact sheet detail page |
+| `image_uuid` | `String` | FK → `image.uuid`, Nullable | Hero/thumbnail image UUID from the `image` table (`ON DELETE SET NULL`) |
+| `attachment_url` | `String(500)` | Nullable | URL to a downloadable PDF or supplementary attachment |
+| `is_active` | `Boolean` | NOT NULL, default=True | Whether the fact sheet is live and visible to employees; False hides it from all orgs |
+| `created_at` | `DateTime (tz)` | NOT NULL, default=now | Record creation timestamp |
+| `updated_at` | `DateTime (tz)` | NOT NULL, default=now, onupdate=now | Last update timestamp |
+| `deleted_at` | `DateTime (tz)` | Nullable | Soft-delete timestamp; NULL = active |
+| `created_by` | `String` | FK → `users.uuid`, Nullable | Bravo staff user who created this fact sheet (via `UserAuditMixin`) |
+| `updated_by` | `String` | FK → `users.uuid`, Nullable | Bravo staff user who last updated this fact sheet (via `UserAuditMixin`) |
+
+#### Indexes & Constraints
+
+| Name | Columns | Type |
+|---|---|---|
+| `idx_fact_sheets_active` | `is_active` WHERE `deleted_at IS NULL` | Partial Index — used on every employee portal load to fetch the active fact sheet list |
+
+---
+
+### Domain 5 — Platform Config & Scheduling
+
+---
+
+### `scheduled_jobs`
+
+**Business Purpose:** Background job queue for all time-based platform operations: benefit go-live status promotions, employee onboarding invitations, R&R birthday and long-service sweeps, monthly roundup emails, fortnightly admin emails, and invite expiry checks. Each row represents a single scheduled execution. Workers poll the table for `status = 'pending'` rows whose `scheduled_for` has elapsed, execute the job, and update the row to `done` or `failed`. The `reference_uuid` + `reference_table` pair provides a polymorphic pointer to the subject entity, allowing workers to explicitly resolve the target row without hardcoding lookup logic based on `job_type`.
+
+**Base Class:** `Base`
+
+#### Columns
+
+| Name | Type | Constraints | Description |
+|---|---|---|---|
+| *(Base fields)* | — | — | `id`, `uuid`, `org_uuid`, `created_at`, `updated_at`, `deleted_at`, `created_by`, `updated_by`, `deleted_by` |
+| `job_type` | `String(40)` | NOT NULL, CHECK IN (`benefit_go_live`, `employee_go_live`, `rnr_birthday_sweep`, `rnr_longservice_sweep`, `rnr_monthly_roundup`, `rnr_fortnightly_admin_email`, `invite_expiry_check`) | Type of scheduled job — determines which worker handler processes this row |
+| `reference_uuid` | `String` | Nullable | UUID of the related subject entity (e.g. the `org_benefit_uuid` for a `benefit_go_live` job, the `membership_uuid` for an `employee_go_live` job). Paired with `reference_table` to form a polymorphic reference |
+| `reference_table` | `String(100)` | Nullable | Table name of the subject entity referenced by `reference_uuid` (e.g. `org_benefits`, `user_org_memberships`). Together with `reference_uuid`, this creates a polymorphic relationship that allows background workers to explicitly know which table to query — without hardcoding table-lookup logic based on `job_type` alone. This decouples job routing from business logic |
+| `scheduled_for` | `DateTime (tz)` | NOT NULL | Timestamp (UK timezone) when this job should be executed; the scheduler sweeps for rows where `scheduled_for <= now() AND status = 'pending'` |
+| `executed_at` | `DateTime (tz)` | Nullable | Timestamp when the worker actually began executing the job; NULL until picked up |
+| `status` | `String(10)` | NOT NULL, default=`pending`, CHECK IN (`pending`, `running`, `done`, `failed`) | Job execution lifecycle: `pending` = waiting to be picked up; `running` = currently being processed by a worker; `done` = completed successfully; `failed` = execution error (see `error_message`) |
+| `error_message` | `Text` | Nullable | Full error message and traceback captured when `status = 'failed'`; used for debugging via the Bravo staff job monitor |
+
+> **SQLAlchemy `__table_args__` Note:** The following ENUM columns require `CheckConstraint` entries:
+> - `job_type`: `CheckConstraint("job_type IN ('benefit_go_live','employee_go_live','rnr_birthday_sweep','rnr_longservice_sweep','rnr_monthly_roundup','rnr_fortnightly_admin_email','invite_expiry_check')", name='ck_scheduled_jobs_job_type')`
+> - `status`: `CheckConstraint("status IN ('pending', 'running', 'done', 'failed')", name='ck_scheduled_jobs_status')`
+
+> **Polymorphic Reference Note (`reference_uuid` + `reference_table`):** These two columns together form an explicit polymorphic pointer. Example: a `benefit_go_live` row carries `reference_uuid = <org_benefits.uuid>` and `reference_table = 'org_benefits'`. The worker reads `reference_table` to determine which model to query, then resolves the row by `reference_uuid`. This avoids brittle `if job_type == 'benefit_go_live': query org_benefits` branches scattered across worker code — the routing information is self-contained in the job row.
+
+#### Indexes & Constraints
+
+| Name | Columns | Type |
+|---|---|---|
+| `idx_scheduled_jobs_run` | `scheduled_for` WHERE `status = 'pending'` | Partial Index — used by the scheduler sweep polling query |
+| `idx_scheduled_jobs_org` | `org_uuid` | Index — used when listing scheduled jobs for a specific org in the admin UI |
+
+---
+
+### Domain 6 — Analytics
+
+---
+
+### `analytics_events`
+
+**Business Purpose:** Raw event log for all significant user interactions across the platform. Aggregated views and materialised queries serve the self-serve analytics dashboard. **Range-partitioned by `occurred_at` (monthly)** for query performance at scale — each monthly partition is a separate physical table, keeping index scans bounded and VACUUM efficient. Self-serve analytics window is capped at 1–2 years at the application layer to limit partition scan depth.
+
+> ⚡ **Partitioning:** This table uses **PostgreSQL declarative range partitioning** on `occurred_at`. New monthly partitions must be pre-created (via `pg_partman` or a scheduled migration). The composite PK (`id`, `occurred_at`) is **required** by PostgreSQL declarative partitioning — the partition key must be included in the primary key.
+
+**Base Class:** `db.Model` directly — **NOT `Base`**. This avoids audit recursion (writing an audit log event for every analytics event would create an infinite loop via `AuditableEvent`) and eliminates unnecessary overhead (`org_uuid` auto-stamping, soft-delete columns, `UserAuditMixin` FK columns) for a high-volume, append-only log that is never updated or soft-deleted.
+
+#### Columns
+
+| Name | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | `BigInteger` | PK **(composite with `occurred_at`)** — required by PostgreSQL declarative partitioning | Surrogate row key — not globally unique across partitions without the `occurred_at` component |
+| `org_uuid` | `String` | FK → `organisations.uuid`, NOT NULL | Tenant scoping — every event is pinned to an org for multi-tenant analytics isolation |
+| `membership_uuid` | `String` | FK → `user_org_memberships.uuid`, Nullable | The employee membership performing the action; NULL for system-generated events (e.g. scheduled job completions) |
+| `team_uuid` | `String` | FK → `org_teams.uuid`, Nullable | Benefit-access team context at the time of the event, if applicable (e.g. for `benefit_viewed` events where team determines the available benefit set) |
+| `event_type` | `String(50)` | NOT NULL, CHECK IN (`employee_registered`, `employee_login`, `benefit_viewed`, `document_downloaded`, `notice_viewed`, `rnr_nomination_created`, `support_ticket_raised`) | Type of tracked interaction — determines which analytics dimension the event rolls up to |
+| `entity_uuid` | `String` | Nullable | UUID of the subject entity involved in the event (e.g. the `org_benefit_uuid` for a `benefit_viewed` event, the `document_uuid` for `document_downloaded`). Stored as a UUID string; polymorphic — no FK constraint as the table does not extend `Base` |
+| `occurred_at` | `DateTime (tz)` | NOT NULL, default=now | Event timestamp — the **partition key**; all range partition boundaries are defined on this column. Must be included in every INSERT and range-scan query |
+
+> **SQLAlchemy `__table_args__` Note:** `event_type` requires:
+> ```python
+> CheckConstraint(
+>     "event_type IN ('employee_registered','employee_login','benefit_viewed',"
+>     "'document_downloaded','notice_viewed','rnr_nomination_created',"
+>     "'support_ticket_raised')",
+>     name='ck_analytics_events_event_type'
+> )
+> ```
+> The composite PK must be declared as:
+> ```python
+> PrimaryKeyConstraint('id', 'occurred_at', name='pk_analytics_events')
+> ```
+
+#### Indexes & Constraints
+
+| Name | Columns | Type |
+|---|---|---|
+| `pk_analytics_events` | `id`, `occurred_at` | Composite Primary Key — required by PostgreSQL declarative partitioning; partition key must be part of the PK |
+| `idx_analytics_org_date` | `org_uuid`, `occurred_at DESC` | Index — primary access pattern: all events for an org within a time window |
+| `idx_analytics_type_date` | `event_type`, `occurred_at DESC` | Index — secondary access pattern: platform-wide event type rollup |
+| *(partitioning)* | `occurred_at` (RANGE, monthly) | Partition Key — one physical child table per calendar month |
+
+#### Partitioning Setup
+
+> ⚡ **Partition Management:** Use `pg_partman` to automate monthly partition creation and retention. Example initial setup:
+>
+> ```sql
+> -- Create the parent partitioned table
+> CREATE TABLE analytics_events (
+>     id          BIGSERIAL,
+>     org_uuid    TEXT NOT NULL,
+>     membership_uuid TEXT,
+>     team_uuid   TEXT,
+>     event_type  TEXT NOT NULL,
+>     entity_uuid TEXT,
+>     occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+>     PRIMARY KEY (id, occurred_at)
+> ) PARTITION BY RANGE (occurred_at);
+>
+> -- Example: create the May 2026 partition
+> CREATE TABLE analytics_events_2026_05
+>     PARTITION OF analytics_events
+>     FOR VALUES FROM ('2026-05-01') TO ('2026-06-01');
+> ```
+>
+> Configure `pg_partman` to pre-create 3 months ahead and retain 24 months of history (drop older partitions to manage storage).
+
+---
+
+### `internal_conversations`
+
+**Business Purpose:** Manages the metadata and lifecycle state for company-to-employee broadcast communications. Strictly separate from `support_tickets` — internal conversations are org-admin-initiated broadcasts (e.g. policy announcements, HR updates), whereas support tickets are employee-initiated enquiries to Bravo staff. A conversation starts as a `draft`, is composed, then transitions to `sent` when the org admin dispatches it. Individual message payloads live in `internal_messages`. Requires `organisations.settings.features.is_internal_messages_enabled = true` to be accessible.
+
+**Base Class:** `Base`
+
+#### Columns
+
+| Name | Type | Constraints | Description |
+|---|---|---|---|
+| *(Base fields)* | — | — | `id`, `uuid`, `org_uuid`, `created_at`, `updated_at`, `deleted_at`, `created_by`, `updated_by`, `deleted_by` |
+| `sender_uuid` | `String` | FK → `user_org_memberships.uuid`, NOT NULL | Membership UUID of the org admin who created and owns this conversation |
+| `subject` | `String(300)` | NOT NULL | Subject line of the broadcast displayed to recipients in their message inbox |
+| `status` | `String(10)` | NOT NULL, default=`draft`, CHECK IN (`draft`, `sent`) | Lifecycle status: `draft` = being composed, not yet dispatched; `sent` = dispatched to recipients, body is immutable |
+
+> **SQLAlchemy `__table_args__` Note:** `status` requires:
+> `CheckConstraint("status IN ('draft', 'sent')", name='ck_internal_conversations_status')`
+
+#### Relationships
+
+| Name | Target | Type | Description | Cascade Behavior |
+|---|---|---|---|---|
+| `sender` | `UserOrgMembership` | Many-to-One | The org admin who created the conversation | `ON DELETE RESTRICT` — membership cannot be deleted while conversations exist |
+| `messages` | `InternalMessage` | One-to-Many | All message payloads within this conversation thread | `ON DELETE CASCADE` — messages removed when the conversation is deleted |
+
+#### Indexes & Constraints
+
+| Name | Columns | Type |
+|---|---|---|
+| `idx_internal_conversations_org` | `org_uuid` | Index |
+| `idx_internal_conversations_sender` | `sender_uuid` | Index |
+| `idx_internal_conversations_status` | `status` WHERE `status = 'draft'` | Partial Index — used to surface draft conversations in the admin compose UI |
+
+---
+
+### `internal_messages`
+
+**Business Purpose:** Stores the individual message payloads within an internal conversation — both the original broadcast body sent by the org admin and any subsequent employee replies within the same thread. Each row is a single message from a single sender. Deleted automatically when the parent `internal_conversations` row is deleted (`ON DELETE CASCADE`). Requires `organisations.settings.features.is_internal_messages_enabled = true`.
+
+**Base Class:** `Base`
+
+#### Columns
+
+| Name | Type | Constraints | Description |
+|---|---|---|---|
+| *(Base fields)* | — | — | `id`, `uuid`, `org_uuid`, `created_at`, `updated_at`, `deleted_at`, `created_by`, `updated_by`, `deleted_by` |
+| `conversation_uuid` | `String` | FK → `internal_conversations.uuid`, NOT NULL | The parent conversation this message belongs to (`ON DELETE CASCADE` — messages are removed when the conversation is deleted) |
+| `sender_uuid` | `String` | FK → `user_org_memberships.uuid`, NOT NULL | Membership UUID of the user who sent this specific message — may be the original org admin sender or an employee replying in the thread |
+| `body` | `Text` | NOT NULL | Full message body content displayed in the conversation thread view |
+| `sent_at` | `DateTime (tz)` | NOT NULL, default=now | Timestamp when the message was sent; used for thread chronological ordering |
+
+#### Relationships
+
+| Name | Target | Type | Description | Cascade Behavior |
+|---|---|---|---|---|
+| `conversation` | `InternalConversation` | Many-to-One | The parent conversation this message belongs to | `ON DELETE CASCADE` — message is removed with the conversation |
+| `sender` | `UserOrgMembership` | Many-to-One | The membership who sent this message | `ON DELETE RESTRICT` — membership cannot be deleted while messages exist |
+
+#### Indexes & Constraints
+
+| Name | Columns | Type |
+|---|---|---|
+| `idx_internal_messages_conversation` | `conversation_uuid` | Index — used to retrieve all messages for a conversation in chronological order |
+| `idx_internal_messages_sender` | `sender_uuid` | Index — used to look up all messages sent by a given membership |
+
+---
+
 ## Deleted Tables — Migration Notes
 
 The following tables from the previous schema version have been **removed** and their data migrated into JSONB columns on surviving tables. This section serves as a migration reference for developers writing Alembic migrations.
@@ -1609,6 +2269,11 @@ The following tables from the previous schema version have been **removed** and 
 | `org_benefit_token_answers` | `org_benefits.token_answers` (JSONB Object) | For each `org_benefit_uuid`, build a `{token_key: answer_value}` map by joining `org_benefit_token_answers` → `benefit_tokens` on `token_uuid`. |
 | `custom_benefit_team_access` | `custom_tiles.visible_to_team_uuids` (JSONB Array) | Aggregate `team_uuid` values per `custom_benefit_uuid` into the array. Empty array = visible to all (preserve existing semantics). |
 | `rnr_perks` | `rnr_config.predefined_perks` (JSONB Array) | Aggregate all active and inactive perks per `org_uuid` into the array, mapping `perk_name` → `name`, `perk_emoji` → `emoji`, `is_active` → `is_active`. Also backfill `rnr_rewards.predefined_perk_name` and `rnr_rewards.predefined_perk_emoji` by joining `rnr_rewards.perk_uuid → rnr_perks.uuid` for all existing rows, then drop `rnr_rewards.perk_uuid` FK column. |
+| `document_team_visibility` | `documents.visible_team_uuids` (JSONB Array) | For each `document_uuid`, aggregate all `team_uuid` values into a JSONB array on `documents.visible_team_uuids`. Documents with no visibility rows should receive an empty array `[]` (meaning visible to all teams — preserves existing semantics). Drop the `document_team_visibility` table after migration. |
+| `notice_team_visibility` | `notices.visible_team_uuids` (JSONB Array) | For each `notice_uuid`, aggregate all `team_uuid` values into a JSONB array on `notices.visible_team_uuids`. Notices with no visibility rows receive `[]` (visible to all). Drop the `notice_team_visibility` table after migration. |
+| `marketing_benefit_links` | `marketing_assets.linked_benefit_uuids` (JSONB Array) | For each `material_uuid` (now `marketing_assets.uuid`), aggregate all `benefit_uuid` values into the `linked_benefit_uuids` JSONB array. After migration, create GIN index on the column, then drop `marketing_benefit_links`. |
+| `marketing_category_materials` | `marketing_assets.category_uuids` (JSONB Array) | For each `material_uuid` (now `marketing_assets.uuid`), aggregate all `category_uuid` values into the `category_uuids` JSONB array. After migration, create GIN index on the column, then drop `marketing_category_materials`. |
+| `advert_org_targets` | `adverts.target_org_uuids` (JSONB Array) | For each `advert_uuid`, aggregate all `org_uuid` values into the `target_org_uuids` JSONB array. After migration, create GIN index on the column, then drop `advert_org_targets`. |
 
 ---
 
@@ -1635,20 +2300,42 @@ organisations (root tenant)
 │   ├── trs_employee_data  ──── user_org_memberships + trs_components
 │   └── trs_statements     ──── user_org_memberships
 │
-└── R&R Stack
-    ├── rnr_config
-    │   ├── predefined_perks  [JSONB array — replaces rnr_perks table]
-    │   └── rules_data        [JSONB supplement of flat rule columns]
-    ├── rnr_teams
-    │   └── rnr_user_teams    ──── user_org_memberships
-    ├── rnr_values
-    ├── rnr_nominations       ──── user_org_memberships + rnr_values
-    │   └── rnr_rewards (1:1) ──── user_org_memberships
-    ├── rnr_budget_individual ──── user_org_memberships  [append-only ledger]
-    └── rnr_budget_team       ──── rnr_teams             [append-only ledger]
+├── R&R Stack
+│   ├── rnr_config
+│   │   ├── predefined_perks  [JSONB array — replaces rnr_perks table]
+│   │   └── rules_data        [JSONB supplement of flat rule columns]
+│   ├── rnr_teams
+│   │   └── rnr_user_teams    ──── user_org_memberships
+│   ├── rnr_values
+│   ├── rnr_nominations       ──── user_org_memberships + rnr_values
+│   │   └── rnr_rewards (1:1) ──── user_org_memberships
+│   ├── rnr_budget_individual ──── user_org_memberships  [append-only ledger]
+│   └── rnr_budget_team       ──── rnr_teams             [append-only ledger]
+│
+└── Content, Support & Marketing Stack
+    ├── documents
+    │   └── visible_team_uuids [JSONB array of org_teams.uuid — replaces document_team_visibility]
+    ├── notices
+    │   ├── visible_team_uuids [JSONB array of org_teams.uuid — replaces notice_team_visibility]
+    │   ├── like_count         [denormalised counter for fast feed generation]
+    │   └── notice_likes       ──── user_org_memberships  [concurrent-write-safe]
+    ├── support_tickets        ──── user_org_memberships
+    │   └── support_ticket_messages ──── users
+    ├── notifications          ──── user_org_memberships  [polymorphic reference]
+    ├── internal_conversations ──── user_org_memberships (sender)
+    │   └── internal_messages  ──── user_org_memberships (sender, replies) [CASCADE]
+    └── adverts (platform-wide)
+        ├── target_org_uuids   [JSONB array — replaces advert_org_targets; GIN indexed]
+        └── advert_user_suppression ──── user_org_memberships  [high-concurrency safe]
 
 Platform-level lookups (no org_uuid):
-  groups, sectors, lead_sources, trs_component_types, image (stock)
+  groups, sectors, lead_sources, trs_component_types, image (stock),
+  templates, marketing_categories, marketing_assets, fact_sheets
+
+Platform infrastructure (org-scoped or unscoped):
+  scheduled_jobs  ──── organisations  [polymorphic ref: reference_uuid + reference_table]
+  analytics_events ──── organisations + user_org_memberships + org_teams
+                       [range-partitioned by occurred_at — NOT Base, no audit recursion]
 ```
 
 ---
@@ -1688,6 +2375,22 @@ Execute Alembic migrations in the following dependency order to respect FK const
 28. rnr_rewards                  (FK → rnr_nominations, user_org_memberships)
 29. rnr_budget_individual        (FK → organisations, user_org_memberships, users)
 30. rnr_budget_team              (FK → organisations, rnr_teams, users)
+31. documents                   (FK → organisations, groups)
+32. notices                     (FK → organisations, groups, image)
+33. notice_likes                (FK → notices, user_org_memberships)
+34. support_tickets             (FK → user_org_memberships, org_benefits, users)
+35. support_ticket_messages     (FK → support_tickets, users)
+36. notifications               (FK → user_org_memberships, organisations)
+37. templates                   (no FK deps — platform-level)
+38. marketing_categories        (no FK deps — platform-level)
+39. marketing_assets            (no FK deps — platform-level; add GIN indexes after data migration)
+40. adverts                     (FK → master_benefits; add GIN index on target_org_uuids after data migration)
+41. advert_user_suppression     (FK → adverts, user_org_memberships)
+42. fact_sheets                 (FK → image)
+43. internal_conversations      (FK → user_org_memberships)
+44. internal_messages           (FK → internal_conversations, user_org_memberships)
+45. scheduled_jobs              (FK → organisations)
+46. analytics_events            (FK → organisations, user_org_memberships, org_teams — range-partitioned; configure pg_partman after creation)
 ```
 
 ---
@@ -1699,4 +2402,7 @@ Execute Alembic migrations in the following dependency order to respect FK const
 | April 28, 2026 | Architecture Review | Initial standardized schema (`bravo_benefits_standardized.md`) published |
 | May 1, 2026 | Architecture Review | **This document.** Applied full refactor: (1) Deleted 8 tables (`two_fa_policy`, `sso_config`, `notification_preferences`, `employee_favourite_benefits`, `benefit_resources`, `benefit_tokens`, `org_benefit_token_answers`, `custom_benefit_team_access`) with data migrated to JSONB columns on parent tables. (2) Added `organisations.force_2fa_for_all` as dedicated top-level Boolean. (3) Added `organisations.settings` JSONB consolidating branding, features, and SSO config. (4) Added `user_org_memberships.notification_preferences` and `favourite_benefit_uuids` JSONB columns. (5) Added `master_benefits.data`, `resources`, `required_tokens` JSONB columns; removed 17 flat columns. (6) Added `org_benefits.data` and `token_answers` JSONB columns; removed 5 flat columns. (7) Renamed `custom_benefits` → `custom_tiles`; added `visible_to_team_uuids` JSONB Array. (8) Renamed `image_library` → `image` throughout. (9) Documented `trs_statements.snapshot_json` key-level structure. (10) Scope restricted to Domain 1 and Domain 2 only. |
 | May 4, 2026 | Architecture Review | **Domain 3 (R&R) added.** Changes: (1) Deleted `rnr_perks` standalone table — migrated perk catalogue into `rnr_config.predefined_perks` JSONB array; backfilled `rnr_rewards.predefined_perk_name` / `predefined_perk_emoji` snapshot columns from existing `perk_uuid` FK joins, then dropped `rnr_rewards.perk_uuid`. (2) Added `rnr_config.predefined_perks` JSONB array (replaces `rnr_perks`). (3) Added `rnr_config.rules_data` JSONB supplement for `approve_before_publish`, `allow_money_rewards`, `allow_perk_rewards`, `acknowledge_birthdays`, `acknowledge_long_service` — flat columns retained as authoritative source. (4) Added `rnr_rewards.predefined_perk_name` and `predefined_perk_emoji` immutable snapshot columns. (5) Removed `rnr_rewards.perk_uuid` FK. (6) Retained `rnr_rewards.custom_perk_text` for free-text ad-hoc perks. (7) Documented strict 1:1 relationship between `rnr_nominations` and `rnr_rewards` with UNIQUE constraint on `rnr_rewards.nomination_uuid`; documented soft-delete guard requiring service-layer check before setting `is_deleted=True` on any nomination with a linked reward. (8) Tables `rnr_teams`, `rnr_user_teams`, `rnr_values`, `rnr_budget_individual`, `rnr_budget_team` carried forward unchanged. (9) Scope updated to Domain 1 · Domain 2 · Domain 3. |
+| May 4, 2026 | Architecture Review | **Domain 4 (Content, Support & Marketing) added.** Changes: (1) Deleted 5 join tables with data migrated to JSONB arrays: `document_team_visibility` → `documents.visible_team_uuids`; `notice_team_visibility` → `notices.visible_team_uuids`; `marketing_benefit_links` → `marketing_assets.linked_benefit_uuids`; `marketing_category_materials` → `marketing_assets.category_uuids`; `advert_org_targets` → `adverts.target_org_uuids`. (2) Renamed `newsfeed_events` → `notifications` to allow future SMS/push expansion. (3) Renamed `email_templates` → `templates` for same reason. (4) Renamed `marketing_materials` → `marketing_assets`. (5) Added `documents.visible_team_uuids` JSONB Array (default `[]`) with `OrgTeam.after_delete` hook documentation. (6) Added `notices.visible_team_uuids` JSONB Array (default `[]`) with same hook pattern. (7) Added `notices.like_count` Integer (default 0) for read-optimised feed generation. (8) Added `marketing_assets.linked_benefit_uuids` and `category_uuids` JSONB Arrays (default `[]`) both with GIN Indexes; documented `MarketingCategory.after_delete` cleanup hook. (9) Added `adverts.target_org_uuids` JSONB Array (default `[]`) with GIN Index. (10) Documented `notice_likes` concurrent-write-safe design (composite PK + INSERT … ON CONFLICT). (11) Documented `advert_user_suppression` high-concurrency dismissal pattern (avoids row-locking `adverts`). (12) Tables `support_tickets`, `support_ticket_messages`, `marketing_categories`, `fact_sheets` carried forward with modern formatting. (13) Scope updated to Domain 1 · Domain 2 · Domain 3 · Domain 4. |
+| May 4, 2026 | Architecture Review | **Domains 5 (Platform Config & Scheduling) and 6 (Analytics) added.** Changes: (1) Added `scheduled_jobs` with full Business Purpose, column-level descriptions, and index documentation. Added new column `reference_table` (String(100), Nullable) paired with `reference_uuid` to form an explicit polymorphic reference — allows background workers to resolve the subject entity table without hardcoding branching logic on `job_type`. (2) Added `analytics_events` with full Business Purpose, column-level descriptions, PostgreSQL declarative range-partitioning documentation (monthly on `occurred_at`), composite PK (`id`, `occurred_at`) requirement documented, `pg_partman` setup example included. Table deliberately extends `db.Model` directly (not `Base`) to avoid audit recursion and unnecessary overhead on a high-volume append-only log. (3) Updated Scope to Domain 1 · Domain 2 · Domain 3 · Domain 4 · Domain 5 · Domain 6. (4) TOC, Overview table, Entity Relationship Summary, and Migration Order all updated. |
+| May 4, 2026 | Architecture Review | **PRD Alignment Pass.** Changes: (1) Removed `organisations.force_2fa_for_all` column entirely — 2FA is now exclusively a user-level choice managed via `users.two_fa_enabled`; no org-level enforcement. Removed associated index `idx_orgs_force_2fa`. Removed key design rule referencing the column. Business Purpose note added to `organisations` documenting the change. (2) Expanded `organisations.settings.features` JSONB sub-object with 5 new module enablement toggles (all default `false`): `is_teams_enabled`, `is_notices_enabled`, `is_documents_enabled`, `is_analytics_enabled`, `is_internal_messages_enabled`. (3) Added `internal_conversations` table (Domain 4) — manages metadata and lifecycle (`draft`/`sent`) for org-admin broadcast communications, strictly separate from Bravo `support_tickets`. (4) Added `internal_messages` table (Domain 4) — stores individual message payloads and employee replies within an internal conversation thread; CASCADE-deleted with parent conversation. (5) TOC, Overview table, Entity Relationship Summary, and Migration Order all updated. |
 
