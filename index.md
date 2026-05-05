@@ -287,9 +287,7 @@ Recommended for: `users`, `user_org_memberships` — models with complex domain 
 
 ### `organisations`
 
-**Business Purpose:** Root tenant entity representing a client company. Every piece of business data in the platform is scoped to an organisation via `org_uuid`. Does **not** extend `Base` — avoids circular FK dependencies since `Base` itself has `org_uuid → organisations.uuid`. Branding, feature flags, and SSO configuration are all consolidated into the `settings` JSONB column to reduce table width and group related configuration logically.
-
-> **2FA Policy Note:** The `force_2fa_for_all` column has been **removed**. Two-factor authentication is now exclusively a user-level choice managed via `users.two_fa_enabled`. There is no org-level 2FA enforcement — individual users opt in or out via their own account settings.
+**Business Purpose:** Root tenant entity representing a client company. Every piece of business data in the platform is scoped to an organisation via `org_uuid`. Does **not** extend `Base` — avoids circular FK dependencies since `Base` itself has `org_uuid → organisations.uuid`. Branding, feature flags, and SSO configuration are all consolidated into the `settings` JSONB column to reduce table width and group related configuration logically. Organisations may also enforce 2FA globally for all their employees via the dedicated `force_2fa_for_all` top-level column, overriding individual user preferences at auth time.
 
 **Base Class:** `db.Model` + `UserAuditMixin`
 
@@ -313,6 +311,7 @@ Recommended for: `users`, `user_org_memberships` — models with complex domain 
 | `employee_count` | `Integer` | Nullable | Expected or actual headcount; used for license sizing and bulk upload validation |
 | `self_registration_url` | `Text` | Unique, Nullable | Unique URL slug used for employee self-registration without an admin invite |
 | `settings` | `JSONB` | NOT NULL, default=`{}` | Consolidated org configuration blob. Contains three sub-objects: `branding` (visual identity), `features` (module feature flags), and `sso` (single sign-on configuration). See **`settings` JSONB Structure** below |
+| `force_2fa_for_all` | `Boolean` | NOT NULL, default=False | **Dedicated top-level column** — when True, every user in this org is required to complete 2FA on login, regardless of their personal 2FA setting. Queried at every auth middleware invocation and must remain a first-class indexed field, not buried in JSONB. |
 | `status` | `String(20)` | NOT NULL, default=`active`, CHECK IN (`active`, `suspended`, `closed`) | Organisation lifecycle status — `suspended` blocks employee logins while retaining data; `closed` triggers GDPR retention clock |
 | `closed_at` | `DateTime (tz)` | Nullable | Timestamp when this org was formally closed; triggers the GDPR data retention deadline calculation |
 | `retain_until` | `DateTime (tz)` | Nullable | GDPR data retention deadline, computed as `closed_at + 7 years`; set by the application on closure |
@@ -406,6 +405,7 @@ The `settings` column stores three logically grouped sub-objects. Developers sho
 |---|---|---|
 | `idx_orgs_group` | `group_uuid` | Index |
 | `idx_orgs_status` | `status` | Index |
+| `idx_orgs_force_2fa` | `force_2fa_for_all` | Index — queried on every auth check |
 | *(standard)* | `uuid` | Unique |
 
 ---
@@ -428,7 +428,7 @@ The `settings` column stores three logically grouped sub-objects. Developers sho
 | `first_name` | `String(100)` | NOT NULL, default=`""` | User's first name; replaced with `"Name Removed"` on GDPR anonymisation at account closure |
 | `last_name` | `String(100)` | NOT NULL, default=`""` | User's last name; scrambled on GDPR anonymisation |
 | `is_bravo_user` | `Boolean` | NOT NULL, default=False | Marks this account as a Bravo platform staff member; bypasses all `org_uuid` filter injection in `Base.get_base_query()` |
-| `two_fa_enabled` | `Boolean` | NOT NULL, default=False | Whether the user has personally enabled 2FA via TOTP setup. This is the sole 2FA control — there is no org-level override; 2FA enforcement is a user-level decision only |
+| `two_fa_enabled` | `Boolean` | NOT NULL, default=False | Whether the user has personally enabled 2FA via TOTP setup; overridden by `organisations.force_2fa_for_all` at auth time. |
 | `two_fa_secret` | `Text` | Nullable | Encrypted TOTP 2FA secret; excluded from all audit log snapshots |
 | `gdpr_anonymised_at` | `DateTime (tz)` | Nullable | Timestamp when PII was anonymised in compliance with GDPR on org closure; signals downstream services to exclude this user from communications |
 | `suppress_all_adverts` | `Boolean` | NOT NULL, default=False | User-level advert suppression override; when True, Bravo adverts are never shown to this user regardless of org settings |
@@ -2391,3 +2391,4 @@ Execute Alembic migrations in the following dependency order to respect FK const
 45. scheduled_jobs              (FK → organisations)
 46. analytics_events            (FK → organisations, user_org_memberships, org_teams — range-partitioned; configure pg_partman after creation)
 ```
+
